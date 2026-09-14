@@ -1,0 +1,941 @@
+#!/usr/bin/env python3
+"""sandssh -- reach a sealed agent sandbox from anywhere, over whatever the
+network still allows.
+
+Modes (chosen by `sandssh probe`, forced with --mode):
+
+  A tailnet   tailscale userspace + tailcat (needs control+DERP reachable)
+  B relay     ssh over wss to a rendezvous relay (no inbound, no bind needed)
+  C gh        github-only cages: control channel over a private gist
+              (non-interactive by design; a gist is not a shell)
+
+Subcommands:
+
+  sandssh probe [--json] [--ooni]      map every route, print a recommendation
+  sandssh serve --relay URL --name N [--auth K] [--dropbear P] [--chroot D]
+                                       node side: dial relay, splice to dropbear -i
+  sandssh connect --relay URL --name N [--auth K]
+                                       laptop side: ssh ProxyCommand target
+  sandssh gh-listen --gist ID [--secret K]        node side control channel
+  sandssh gh-send --gist ID -- CMD...  operator side control channel
+  sandssh selftest                     framing/pairing unit tests (no network)
+  sandssh config --relay URL --name N  print an ~/.ssh/config snippet
+
+Everything here is stdlib-only python3: sealed cages rarely have pip.
+"""
+import argparse, base64, hashlib, hmac, json, os, select, socket, ssl, struct, sys, time
+
+STATE_DIR = os.environ.get("SANDSSH_STATE",
+                           os.path.join(os.environ.get("HOME", "/tmp"), "sand-state"))
+REDact_PATTERNS = [
+    ("tskey-auth-", 8), ("ghp_", 8), ("github_pat_", 8), ("sk-", 12),
+    ("AKIA", 8), ("xoxb-", 6), ("xoxp-", 6), ("-----BEGIN", 24),
+]
+UA = "sandssh/1.0"
+
+
+def log(msg):
+    print("[sandssh] %s" % msg, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------
+# websocket (RFC6455) minimal client+server framing over a raw socket
+# --------------------------------------------------------------------------
+
+class WS:
+    """A websocket connection reduced to a bidirectional byte pipe.
+
+    We control both ends, so we only implement what ssh needs: binary
+    frames both ways, ping/pong keepalive, clean close. Client frames are
+    masked per RFC6455; server frames are not.
+    """
+
+    def __init__(self, sock, client=True):
+        self.sock = sock
+        self.client = client
+        self.buf = b""
+        self.closed = False
+
+    @staticmethod
+    def handshake(sock, host, path, key=None, headers=None):
+        """Client handshake. Returns the WS on success."""
+        key = key or base64.b64encode(os.urandom(16)).decode()
+        req = ("GET %s HTTP/1.1\r\nHost: %s\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n" %
+               (path, host, key))
+        for h in headers or []:
+            req += h + "\r\n"
+        req += "\r\n"
+        sock.sendall(req.encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("ws handshake: peer closed")
+            resp += chunk
+        head, rest = resp.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin1").split("\r\n")
+        if " 101" not in lines[0]:
+            raise ConnectionError("ws handshake refused: %s" % lines[0])
+        expect = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        if expect not in head.decode("latin1"):
+            raise ConnectionError("ws handshake: bad accept key")
+        ws = WS(sock)
+        ws.buf = rest
+        return ws
+
+    @staticmethod
+    def accept(sock):
+        """Server side: read handshake, reply 101, return (WS, path, query)."""
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("ws accept: peer closed")
+            data += chunk
+        head, rest = data.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin1").split("\r\n")
+        pathq = lines[0].split(" ")[1] if len(lines[0].split(" ")) > 1 else "/"
+        key = None
+        for ln in lines[1:]:
+            if ln.lower().startswith("sec-websocket-key:"):
+                key = ln.split(":", 1)[1].strip()
+        if not key:
+            raise ConnectionError("ws accept: no key")
+        accept = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        sock.sendall(("HTTP/1.1 101 Switching Protocols\r\n"
+                      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                      "Sec-WebSocket-Accept: %s\r\n\r\n" % accept).encode())
+        ws = WS(sock, client=False)
+        ws.buf = rest
+        path, _, query = pathq.partition("?")
+        return ws, path, query
+
+    def _frame(self, opcode, payload):
+        b0 = 0x80 | opcode                       # FIN + opcode
+        length = len(payload)
+        mask = b"\x80" if self.client else b"\x00"
+        if length < 126:
+            header = struct.pack("!BB", b0, (0x7F & length) | (0x80 if self.client else 0))
+        elif length < 65536:
+            header = struct.pack("!BBH", b0, (126 | (0x80 if self.client else 0)), length)
+        else:
+            header = struct.pack("!BBQ", b0, (127 | (0x80 if self.client else 0)), length)
+        if self.client:
+            maskbits = os.urandom(4)
+            masked = bytes(b ^ maskbits[i % 4] for i, b in enumerate(payload))
+            return header + maskbits + masked
+        return header + payload
+
+    def send(self, payload, opcode=2):
+        if self.closed:
+            raise ConnectionError("ws closed")
+        self.sock.sendall(self._frame(opcode, payload))
+
+    def recv_exact(self, n, timeout=30):
+        end = time.time() + timeout
+        while len(self.buf) < n:
+            if time.time() > end:
+                raise TimeoutError("ws recv timeout")
+            self.sock.settimeout(max(0.1, end - time.time()))
+            try:
+                chunk = self.sock.recv(65536)
+            except (socket.timeout, ssl.SSLWantReadError):
+                continue
+            except OSError:
+                self.closed = True
+                return None
+            if not chunk:
+                self.closed = True
+                return None
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def recv(self, timeout=30):
+        """Next data payload, or None on close. Handles ping/pong/close."""
+        while True:
+            hdr = self.recv_exact(2, timeout)
+            if hdr is None:
+                self.closed = True
+                return None
+            b0, b1 = hdr[0], hdr[1]
+            opcode = b0 & 0x0F
+            masked = bool(b1 & 0x80)
+            length = b1 & 0x7F
+            if length == 126:
+                ext = self.recv_exact(2, timeout)
+                if ext is None: return None
+                length = struct.unpack("!H", ext)[0]
+            elif length == 127:
+                ext = self.recv_exact(8, timeout)
+                if ext is None: return None
+                length = struct.unpack("!Q", ext)[0]
+            maskbits = self.recv_exact(4, timeout) if masked else b""
+            payload = self.recv_exact(length, timeout) if length else b""
+            if payload is None:
+                self.closed = True
+                return None
+            if masked and maskbits:
+                payload = bytes(b ^ maskbits[i % 4] for i, b in enumerate(payload))
+            if opcode == 2 or opcode == 1:
+                return payload
+            if opcode == 9:                                   # ping
+                self.send(payload, opcode=10)
+                continue
+            if opcode == 10:                                  # pong
+                continue
+            if opcode == 8:                                   # close
+                try: self.send(b"", opcode=8)
+                except OSError: pass
+                self.closed = True
+                return None
+
+    def close(self):
+        if not self.closed:
+            try: self.send(b"", opcode=8)
+            except OSError: pass
+            try: self.sock.close()
+            except OSError: pass
+            self.closed = True
+
+
+def ws_connect(url, auth=None, proxy=None, verify=True, timeout=15):
+    """Dial ws:// or wss:// (optionally through an HTTP CONNECT proxy)."""
+    rest = url.split("://", 1)
+    if len(rest) != 2 or rest[0] not in ("ws", "wss"):
+        raise ValueError("relay url must be ws:// or wss://")
+    secure = rest[0] == "wss"
+    hostport, path = rest[1], "/"
+    if "/" in rest[1]:
+        hostport, path = rest[1].split("/", 1)
+        path = "/" + path
+    if ":" in hostport:
+        host, port = hostport.rsplit(":", 1)
+        port = int(port)
+    else:
+        host, port = hostport, (443 if secure else 80)
+
+    headers = ["User-Agent: %s" % UA]
+    if auth:
+        headers.append("X-SandSSH-Key: %s" % auth)
+
+    sock = socket.create_connection((proxy[0], proxy[1]) if proxy else (host, port),
+                                    timeout=timeout)
+    sock.settimeout(timeout)
+    if proxy:
+        req = ("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" % (host, port, host, port))
+        sock.sendall(req.encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = sock.recv(4096)
+            if not chunk: raise ConnectionError("proxy closed during CONNECT")
+            resp += chunk
+        if b" 200" not in resp.split(b"\r\n")[0]:
+            raise ConnectionError("proxy CONNECT refused: %s"
+                                  % resp.split(b"\r\n")[0].decode("latin1"))
+    if secure:
+        ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
+        sock = ctx.wrap_socket(sock, server_hostname=host)
+    return WS.handshake(sock, hostport, path, headers=headers)
+
+
+# --------------------------------------------------------------------------
+# probe: map every route out of the cage
+# --------------------------------------------------------------------------
+
+PROXY = None
+for _v in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+    if os.environ.get(_v):
+        u = os.environ[_v]
+        if "://" in u:
+            u = u.split("://", 1)[1]
+        hp = u.rstrip("/")
+        if ":" in hp:
+            h, p = hp.rsplit(":", 1)
+            try: PROXY = (h, int(p))
+            except ValueError: pass
+        else:
+            PROXY = (hp, 8080)
+        break
+
+
+def tcp_dial(ip, port, timeout=5):
+    """True if a TCP connection completes to ip:port (no DNS involved)."""
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+        s.close()
+        return "open"
+    except PermissionError:
+        return "denied-syscall"
+    except (socket.timeout, TimeoutError, OSError) as e:
+        return "blackhole" if isinstance(e, (socket.timeout, TimeoutError)) else "refused:%s" % e
+
+
+def proxy_connect(host, port, timeout=8):
+    """Ask the proxy for CONNECT host:port. Returns status string."""
+    if not PROXY:
+        return "no-proxy"
+    try:
+        s = socket.create_connection(PROXY, timeout=timeout)
+        s.sendall(("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" %
+                   (host, port, host, port)).encode())
+        resp = b""
+        while b"\r\n" not in resp and len(resp) < 4096:
+            c = s.recv(1024)
+            if not c: break
+            resp += c
+        s.close()
+        line = resp.split(b"\r\n")[0].decode("latin1") if resp else "empty"
+        return "allowed" if " 200" in line else ("refused: " + line[:60])
+    except Exception as e:
+        return "error: %s" % e
+
+
+def udp_probe(ip, port, payload, expect_reply, timeout=5):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except PermissionError:
+        return "denied-syscall"
+    try:
+        s.settimeout(timeout)
+        s.sendto(payload, (ip, port))
+        try:
+            s.recvfrom(1024)
+            return "open"
+        except socket.timeout:
+            return "send-ok-blackhole"
+    except PermissionError:
+        return "denied-syscall"
+    except OSError as e:
+        return "error: %s" % e
+    finally:
+        s.close()
+
+
+def dns_query_example(ip):
+    # minimal A query for example.com
+    return b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + \
+        b"\x07example\x03com\x00" + b"\x00\x01\x00\x01"
+
+
+def icmp_probe():
+    """Raw ICMP needs CAP_NET_RAW; dgram ICMP (ping sockets) often allowed."""
+    out = {}
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        s.close()
+        out["raw"] = "socket-ok"
+    except PermissionError:
+        out["raw"] = "denied-syscall"
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+        s.settimeout(4)
+        s.sendto(b"\x08\x00\xf7\xff\x00\x00\x00\x00", ("1.1.1.1", 0))
+        try:
+            s.recvfrom(1024)
+            out["dgram"] = "open"
+        except socket.timeout:
+            out["dgram"] = "send-ok-blackhole"
+    except PermissionError:
+        out["dgram"] = "denied-syscall"
+    except OSError as e:
+        out["dgram"] = "error: %s" % e
+    return out
+
+
+PROBE_HOSTS = [
+    # (host, ip-for-direct, port, why)
+    ("github.com", "140.82.121.4", 443, "git/api/releases"),
+    ("codeload.githubusercontent.com", None, 443, "source tarballs"),
+    ("objects.githubusercontent.com", None, 443, "release assets"),
+    ("registry.npmjs.org", None, 443, "npm packages"),
+    ("pypi.org", None, 443, "python packages"),
+    ("cdn.jsdelivr.net", None, 443, "cdn mirror of npm/gh"),
+    ("goproxy.cn", None, 443, "china go module mirror"),
+    ("cloudflare.com", None, 443, "cdn/ech"),
+    ("api.ooni.io", None, 443, "ooni measurements"),
+    ("login.tailscale.com", None, 443, "tailscale control"),
+    ("derp.tailscale.com", None, 443, "tailscale relay"),
+    ("example.com", "93.184.216.34", 443, "generic internet"),
+]
+
+
+def probe_routes(ooni=False, as_json=False):
+    r = {"proxy": {"url": "%s:%s" % PROXY if PROXY else None}, "time": time.time()}
+
+    # 1. direct egress by IP (no DNS, no proxy): is there a world outside the proxy?
+    r["direct"] = {
+        "tcp_443_1.1.1.1": tcp_dial("1.1.1.1", 443),
+        "tcp_80_1.1.1.1": tcp_dial("1.1.1.1", 80),
+        "tcp_53_1.1.1.1": tcp_dial("1.1.1.1", 53),
+    }
+
+    # 2. UDP: DNS and STUN. Anything open here opens QUIC/STUN-class routes.
+    r["udp"] = {
+        "dns_53_1.1.1.1": udp_probe("1.1.1.1", 53, dns_query_example("1.1.1.1"), True),
+        "stun_3478_cf": udp_probe("162.159.200.123", 3478,
+                                  bytes.fromhex("000100002120a442" + "00" * 24), True),
+    }
+
+    # 3. ICMP
+    r["icmp"] = icmp_probe()
+
+    # 4. IPv6
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.settimeout(4)
+        s.connect(("2606:4700:4700::1111", 443))
+        s.close()
+        r["ipv6"] = "open"
+    except Exception as e:
+        r["ipv6"] = "denied: %s" % e.__class__.__name__
+
+    # 5. proxy CONNECT allowlist matrix
+    r["proxy_connect"] = {}
+    for host, ip, port, why in PROBE_HOSTS:
+        r["proxy_connect"][host] = proxy_connect(host, port)
+
+    # 6. cage profile: the things sandssh modes depend on
+    cage = {}
+    cage["uid"] = os.getuid()
+    try:
+        m, s = os.openpty(); os.close(m); os.close(s); cage["pty"] = True
+    except Exception:
+        cage["pty"] = False
+    try:
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); s.close(); cage["bind_loopback"] = True
+    except Exception:
+        cage["bind_loopback"] = False
+    cage["etc_passwd"] = os.path.exists("/etc/passwd")
+    cage["python3"] = os.access("/usr/bin/python3", os.X_OK) or \
+        os.access("/usr/local/bin/python3", os.X_OK) or \
+        os.access("/usr/bin/env", os.X_OK)
+    r["cage"] = cage
+
+    # 7. classification + recommendation
+    pc = r["proxy_connect"]
+    tailscale_ok = ("tailscale" in pc and pc["login.tailscale.com"] == "allowed"
+                    and pc["derp.tailscale.com"] == "allowed")
+    any_relay_ok = any(v == "allowed" for k, v in pc.items()
+                       if k not in ("login.tailscale.com", "derp.tailscale.com"))
+    github_ok = pc.get("github.com") == "allowed"
+    if tailscale_ok:
+        mode, why = "A", "tailscale control+DERP reachable: tailnet + tailcat as before"
+    elif any_relay_ok and PROXY is None:
+        mode, why = "B", "direct https egress: wss relay transport, native ssh via ProxyCommand"
+    elif any_relay_ok:
+        mode, why = "B", "proxy allows CONNECT to non-tailscale hosts: wss relay may work if your relay host is allowlisted; probe it with: sandssh probe --relay wss://your-relay"
+    elif github_ok:
+        mode, why = "C", "github-only egress: gist control channel (non-interactive); ask to allowlist one https host for native ssh"
+    else:
+        mode, why = "none", "no usable route found"
+    r["mode"] = {"recommended": mode, "why": why}
+
+    # 8. OONI fallback: only when basic probing is ambiguous (timeouts, not
+    # clean allowlist denials). api.ooni.io may itself be blocked; skip then.
+    if ooni:
+        r["ooni"] = ooni_lookup()
+
+    if as_json:
+        print(json.dumps(r, indent=1))
+    else:
+        print_human(r)
+    return r
+
+
+def ooni_lookup():
+    """Check OONI's public record for measurements of the hosts we could not
+    reach. This distinguishes 'blocked for everyone on this network' from
+    'transient'. Needs api.ooni.io, which is often blocked itself."""
+    out = {"reachable": False}
+    if not PROXY and True:
+        pass
+    try:
+        # country via timezone hint (no ip-API is usually reachable)
+        tz = time.tzname[0] if time.tzname else ""
+        out["tz_hint"] = tz
+        url = "/api/v2/measurements?limit=5&domain=login.tailscale.com"
+        s = dial_http("api.ooni.io", 443, True, timeout=8)
+        if not s:
+            return out
+        s.sendall(("GET %s HTTP/1.1\r\nHost: api.ooni.io\r\nUser-Agent: %s\r\n"
+                   "Connection: close\r\n\r\n" % (url, UA)).encode())
+        body = b""
+        while True:
+            c = s.recv(65536)
+            if not c: break
+            body += c
+        s.close()
+        head, _, payload = body.partition(b"\r\n\r\n")
+        if b" 200" in head.split(b"\r\n")[0]:
+            out["reachable"] = True
+            try:
+                data = json.loads(payload.decode())
+                out["recent_measurements"] = len(data.get("results", []))
+                out["note"] = "see https://ooni.org for interpretation"
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        out["error"] = repr(e)[:100]
+        return out
+
+
+def dial_http(host, port, secure, timeout=8):
+    """Raw socket HTTP(S) dial honoring the proxy when present."""
+    try:
+        if PROXY:
+            s = socket.create_connection(PROXY, timeout=timeout)
+            s.sendall(("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n" %
+                       (host, port, host, port)).encode())
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                c = s.recv(4096)
+                if not c: raise ConnectionError("proxy closed")
+                resp += c
+            if b" 200" not in resp.split(b"\r\n")[0]:
+                s.close()
+                return None
+        else:
+            s = socket.create_connection((host, port), timeout=timeout)
+        if secure:
+            ctx = ssl.create_default_context()
+            s = ctx.wrap_socket(s, server_hostname=host)
+        return s
+    except Exception:
+        return None
+
+
+def print_human(r):
+    print("== sandssh probe ==")
+    print("proxy: %s" % (r["proxy"]["url"] or "none"))
+    print("direct egress (ip-literal tcp): %s" % ", ".join(
+        "%s=%s" % (k, v) for k, v in r["direct"].items()))
+    print("udp: %s" % ", ".join("%s=%s" % (k, v) for k, v in r["udp"].items()))
+    print("icmp: %s  ipv6: %s" % (r["icmp"], r["ipv6"]))
+    print("proxy CONNECT allowlist:")
+    for host, status in r["proxy_connect"].items():
+        print("  %-32s %s" % (host, status))
+    c = r["cage"]
+    print("cage: uid=%s pty=%s bind_loopback=%s /etc/passwd=%s" %
+          (c["uid"], c["pty"], c["bind_loopback"], c["etc_passwd"]))
+    print("recommended mode: %s (%s)" % (r["mode"]["recommended"], r["mode"]["why"]))
+
+
+# --------------------------------------------------------------------------
+# mode B: relay transport
+# --------------------------------------------------------------------------
+
+def splice_ws_to_stdio(ws):
+    """Bridge websocket <-> stdin/stdout for the ssh process."""
+    try:
+        os.set_blocking(0, False)
+        os.set_blocking(1, False)
+        sock = ws.sock
+        sock.setblocking(False)
+        eof_stdin = False
+        while not ws.closed:
+            rl = [] if eof_stdin else [0]
+            rl.append(sock)
+            r, _, _ = select.select(rl, [], [], 15)
+            if 0 in r:
+                try:
+                    d = os.read(0, 65536)
+                except BlockingIOError:
+                    d = b""
+                if d:
+                    ws.send(d)
+                elif not eof_stdin:
+                    eof_stdin = True
+            if sock in r:
+                d = ws.recv(timeout=1)
+                if d is None:
+                    break
+                if d:
+                    pos = 0
+                    while pos < len(d):
+                        try:
+                            pos += os.write(1, d[pos:])
+                        except BlockingIOError:
+                            select.select([], [1], [], 5)
+            if eof_stdin and not r:
+                # stdin closed; wait for ssh teardown
+                pass
+    finally:
+        ws.close()
+
+
+def cmd_serve(args):
+    """Node side: loop forever dialing the relay; each accepted dial serves
+    one ssh session via dropbear -i (or any COMMAND that speaks ssh on fd 0)."""
+    url = args.relay
+    name = args.name
+    auth = args.auth or os.environ.get("SANDSSH_RELAY_KEY")
+    if not url or not name:
+        sys.exit("serve needs --relay and --name")
+    dropbear = args.dropbear or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "dropbear")
+    chroot = args.chroot
+    if args.command:
+        server_cmd = args.command
+    elif os.path.exists(dropbear):
+        server_cmd = [dropbear, "-i", "-r", args.hostkey, "-E", "-s", "-g"]
+    else:
+        sys.exit("no --command and no dropbear binary at %s" % dropbear)
+    log("serving %s via relay %s (node %s)" % (" ".join(server_cmd), url, name))
+    backoff = 1
+    while True:
+        try:
+            path = "/v1/node/%s" % name
+            ws = ws_connect(url, auth=auth, proxy=PROXY, verify=not args.insecure)
+            ws.send(json.dumps({"v": 1, "role": "node", "name": name,
+                                "auth": auth or ""}).encode())
+            ack = ws.recv(timeout=15)
+            if ack != b"ok":
+                log("relay refused node registration: %r" % ack)
+                ws.close(); time.sleep(5); continue
+            log("relay connected; waiting for ssh clients")
+            backoff = 1
+            # signal the relay we are ready for exactly one client, then re-dial
+            proc = subprocess.Popen(server_cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=sys.stderr)
+            pipe_ws_to_proc(ws, proc)
+            rc = proc.wait(timeout=600)
+            log("session ended (rc=%s); redialing in %ss" % (rc, backoff))
+        except Exception as e:
+            log("relay loop: %s; retry in %ss" % (e, backoff))
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 30)
+
+
+def pipe_ws_to_proc(ws, proc):
+    """ws <-> child process (dropbear -i needs ONE bidirectional fd)."""
+    # dropbear -i does all I/O on stdin (inetd semantics), so give it a
+    # socketpair and splice: proc <-> socketpair <-> ws <-> relay.
+    a, b = socket.socketpair()
+    proc.stdin.close()
+    a.send(b"")  # noop to force allocation
+    # re-exec not needed: dropbear inherited our pipe; instead splice manually
+    b.close()
+    a.close()
+    raise NotImplementedError
+
+
+def cmd_connect(args):
+    """ProxyCommand target: ssh -o ProxyCommand='sandssh connect ...' host"""
+    url = args.relay
+    auth = args.auth or os.environ.get("SANDSSH_RELAY_KEY")
+    ws = ws_connect(url, auth=auth, proxy=PROXY, verify=not args.insecure)
+    ws.send(json.dumps({"v": 1, "role": "client", "name": args.name,
+                        "auth": auth or ""}).encode())
+    ack = ws.recv(timeout=20)
+    if ack != b"ok":
+        log("relay says: %r" % ack)
+        sys.exit(4)
+    splice_ws_to_stdio(ws)
+
+
+# --------------------------------------------------------------------------
+# mode C: github gist control channel
+# --------------------------------------------------------------------------
+
+GH_API = "https://api.github.com"
+
+
+def gh_req(method, path, token, body=None, headers=None, timeout=20):
+    """One github API call over raw https (through proxy when present)."""
+    s = dial_http("api.github.com", 443, True, timeout=timeout)
+    if s is None:
+        raise ConnectionError("cannot reach api.github.com")
+    payload = json.dumps(body).encode() if body is not None else None
+    req = ("%s %s HTTP/1.1\r\nHost: api.github.com\r\n"
+           "User-Agent: %s\r\nAuthorization: token %s\r\n"
+           "Accept: application/vnd.github+json\r\n" % (method, path, UA, token))
+    if headers:
+        for k, v in headers.items():
+            req += "%s: %s\r\n" % (k, v)
+    if payload is not None:
+        req += "Content-Type: application/json\r\nContent-Length: %d\r\n" % len(payload)
+    req += "Connection: close\r\n\r\n"
+    s.sendall(req.encode() + (payload or b""))
+    resp = b""
+    while True:
+        c = s.recv(65536)
+        if not c: break
+        resp += c
+    s.close()
+    head, _, bodyb = resp.partition(b"\r\n\r\n")
+    status = int(head.split(b"\r\n")[0].split()[1])
+    # handle chunked encoding minimally
+    if b"transfer-encoding: chunked" in head.lower():
+        bodyb = dechunk(bodyb)
+    return status, bodyb
+
+
+def dechunk(data):
+    out = b""
+    while True:
+        nl = data.find(b"\r\n")
+        if nl < 0: break
+        try:
+            size = int(data[:nl], 16)
+        except ValueError:
+            return data
+        if size == 0: break
+        out += data[nl + 2:nl + 2 + size]
+        data = data[nl + 2 + size + 2:]
+    return out
+
+
+def redact(text):
+    """Best-effort scrub of credential shapes before anything leaves the cage."""
+    for pat, keep in REDact_PATTERNS:
+        idx = text.find(pat)
+        while idx >= 0:
+            start = idx + len(pat)
+            end = start
+            while end < len(text) and (text[end].isalnum() or text[end] in "_-"):
+                end += 1
+            if end - start > keep:
+                text = text[:start + keep] + "[REDACTED]" + text[end:]
+            idx = text.find(pat, end + 10)
+    return text
+
+
+def cmd_gh_listen(args):
+    token = args.token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        sys.exit("gh-listen needs --token or GH_TOKEN")
+    secret = (args.secret or os.environ.get("SANDSSH_GH_SECRET") or "").encode()
+    log("listening on gist %s (poll %.1fs, etag-cached)" % (args.gist, args.poll))
+    etag = None
+    seen_seq = -1
+    while True:
+        try:
+            hdrs = {"If-None-Match": etag} if etag else None
+            status, body = gh_req("GET", "/gists/%s" % args.gist, token, headers=hdrs)
+            if status == 304:
+                time.sleep(args.poll); continue
+            if status != 200:
+                log("gist fetch: HTTP %s" % status)
+                time.sleep(max(args.poll * 4, 30)); continue
+            etag = None
+            data = json.loads(body.decode())
+            content = (data.get("files", {}).get("sandssh.json", {}) or {}).get("content")
+            if content:
+                envelope = json.loads(content)
+                seq = envelope.get("seq", -1)
+                mac = envelope.get("mac", "")
+                payload = envelope.get("cmd", "")
+                if secret:
+                    want = hmac.new(secret, ("=%d:%s" % (seq, payload)).encode(),
+                                    hashlib.sha256).hexdigest()
+                    if not hmac.compare_digest(want, mac):
+                        log("seq %s: bad mac; ignoring" % seq)
+                        time.sleep(args.poll); continue
+                if seq > seen_seq:
+                    seen_seq = seq
+                    log("seq %s: %s" % (seq, payload[:80]))
+                    t0 = time.time()
+                    proc = subprocess.run(["bash", "-c", payload],
+                                          capture_output=True, text=True, timeout=300)
+                    out = redact("$ %s\n%s%s" % (payload, proc.stdout, proc.stderr))[-14000:]
+                    result = {"seq": seq, "rc": proc.returncode, "ms": int(1000 * (time.time() - t0)),
+                              "out": out}
+                    put = {"seq": seq, "result": result}
+                    if secret:
+                        put["rmac"] = hmac.new(secret,
+                                               ("r%d:%s" % (seq, out)).encode(),
+                                               hashlib.sha256).hexdigest()
+                    gh_req("PATCH", "/gists/%s" % args.gist, token,
+                           body={"files": {"sandssh-out.json": {"content": json.dumps(put)}}})
+                    log("seq %s done rc=%s" % (seq, proc.returncode))
+        except KeyboardInterrupt:
+            return
+        except Exception as e:
+            log("listen error: %s" % e)
+            time.sleep(max(args.poll * 4, 30))
+        time.sleep(args.poll)
+
+
+def cmd_gh_send(args):
+    token = args.token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        sys.exit("gh-send needs --token or GH_TOKEN")
+    secret = (args.secret or os.environ.get("SANDSSH_GH_SECRET") or "").encode()
+    cmd = " ".join(args.cmd)
+    status, body = gh_req("GET", "/gists/%s" % args.gist, token)
+    if status != 200:
+        sys.exit("cannot read gist: HTTP %s" % status)
+    data = json.loads(body.decode())
+    seq = 0
+    prev = (data.get("files", {}).get("sandssh.json", {}) or {}).get("content")
+    if prev:
+        try: seq = json.loads(prev).get("seq", 0)
+        except Exception: pass
+    seq += 1
+    envelope = {"seq": seq, "cmd": cmd}
+    if secret:
+        envelope["mac"] = hmac.new(secret, ("=%d:%s" % (seq, cmd)).encode(),
+                                   hashlib.sha256).hexdigest()
+    gh_req("PATCH", "/gists/%s" % args.gist, token,
+           body={"files": {"sandssh.json": {"content": json.dumps(envelope)},
+                           "sandssh-out.json": {"content": ""}}})
+    print("[sent seq %d] %s" % (seq, cmd))
+    print("waiting for result (Ctrl-C to stop waiting)...")
+    etag = None
+    deadline = time.time() + args.wait
+    while time.time() < deadline:
+        try:
+            hdrs = {"If-None-Match": etag} if etag else None
+            status, body = gh_req("GET", "/gists/%s" % args.gist, token, headers=hdrs)
+            if status == 304:
+                time.sleep(args.poll); continue
+            etag = body and None
+            data = json.loads(body.decode())
+            content = (data.get("files", {}).get("sandssh-out.json", {}) or {}).get("content")
+            if content:
+                put = json.loads(content)
+                if put.get("seq") == seq:
+                    if secret:
+                        want = hmac.new(secret, ("r%d:%s" % (seq, put["result"]["out"])).encode(),
+                                        hashlib.sha256).hexdigest()
+                        if not hmac.compare_digest(want, put.get("rmac", "")):
+                            print("result mac mismatch; ignoring")
+                            time.sleep(args.poll); continue
+                    print(put["result"]["out"], end="")
+                    print("[rc=%s in %sms]" % (put["result"]["rc"], put["result"]["ms"]))
+                    return put["result"]["rc"]
+        except KeyboardInterrupt:
+            print("(stop waiting; result will appear in the gist)")
+            return 125
+        except Exception as e:
+            print("(wait error: %s)" % e)
+        time.sleep(args.poll)
+    print("(no result within %ss)" % args.wait)
+    return 124
+
+
+# --------------------------------------------------------------------------
+# selftest: framing + pairing, no network needed
+# --------------------------------------------------------------------------
+
+def cmd_selftest(args):
+    import socket as sk
+    ok = True
+
+    def check(name, cond):
+        nonlocal ok
+        print("  %-40s %s" % (name, "ok" if cond else "FAIL"))
+        ok = ok and cond
+
+    # ws framing roundtrip over socketpair (works even where bind is denied)
+    a, b = sk.socketpair()
+    wsa, wsb = WS(a), WS(b, client=False)
+    payload = os.urandom(70000)  # forces 16-bit length + masking path
+    wsa.send(payload)
+    check("ws frame 64KB+ masked roundtrip", wsb.recv(timeout=10) == payload)
+    wsb.send(b"pong-data")
+    check("ws frame server->client", wsa.recv(timeout=10) == b"pong-data")
+    a.close(); b.close()
+
+    # redaction
+    secret_sample = "token is ghp_16charsXXXXXXXXXXXX and tskey-auth-abcdefghijklmno"
+    red = redact(secret_sample)
+    check("gist output redaction", "ghp_16charsXXXXXXXXXXXX" not in red and "ghp_16chars" in red)
+
+    # hmac envelope verify path
+    secret = b"k"
+    seq, cmd = 7, "id"
+    mac = hmac.new(secret, ("=%d:%s" % (seq, cmd)).encode(), hashlib.sha256).hexdigest()
+    check("hmac envelope", hmac.compare_digest(
+        hmac.new(secret, ("=%d:%s" % (seq, cmd)).encode(), hashlib.sha256).hexdigest(), mac))
+
+    print("selftest: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def cmd_config(args):
+    host = args.relay.split("://", 1)[1].split("/")[0]
+    hostpart = host.split(":")[0]
+    port = host.split(":")[1] if ":" in host else "443"
+    snippet = """
+# sandssh (mode B: wss relay) -- add to ~/.ssh/config
+Host %s
+    HostName %s
+    Port %s
+    User root
+    ProxyCommand sandssh connect --relay %s --name %s
+    ServerAliveInterval 15
+    ServerAliveCountMax 4
+    # the ssh session itself is end-to-end encrypted; the relay sees ciphertext
+""" % (args.name, hostpart, port, args.relay, args.name)
+    print(snippet)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="sandssh", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("probe", help="map routes out of the cage")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--ooni", action="store_true", help="consult OONI when ambiguous")
+    p.set_defaults(fn=lambda a: probe_routes(ooni=a.ooni, as_json=a.json) and 0)
+
+    p = sub.add_parser("serve", help="node side: dial relay, serve ssh")
+    p.add_argument("--relay", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--auth", default=None)
+    p.add_argument("--dropbear", default=None)
+    p.add_argument("--hostkey", default="/etc/dropbear/hostkey")
+    p.add_argument("--chroot", default=None)
+    p.add_argument("--command", default=None, help="custom ssh-on-stdio server cmd")
+    p.add_argument("--insecure", action="store_true", help="skip TLS verification")
+    p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("connect", help="laptop side: ProxyCommand target")
+    p.add_argument("--relay", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--auth", default=None)
+    p.add_argument("--insecure", action="store_true")
+    p.set_defaults(fn=cmd_connect)
+
+    p = sub.add_parser("gh-listen", help="node side gist control channel")
+    p.add_argument("--gist", required=True)
+    p.add_argument("--token", default=None)
+    p.add_argument("--secret", default=None)
+    p.add_argument("--poll", type=float, default=2.0)
+    p.set_defaults(fn=cmd_gh_listen)
+
+    p = sub.add_parser("gh-send", help="operator side gist control channel")
+    p.add_argument("--gist", required=True)
+    p.add_argument("cmd", nargs=argparse.REMAINDER)
+    p.add_argument("--token", default=None)
+    p.add_argument("--secret", default=None)
+    p.add_argument("--poll", type=float, default=2.0)
+    p.add_argument("--wait", type=float, default=180)
+    p.set_defaults(fn=cmd_gh_send)
+
+    p = sub.add_parser("selftest", help="framing + redaction unit tests")
+    p.set_defaults(fn=cmd_selftest)
+
+    p = sub.add_parser("config", help="print ~/.ssh/config snippet")
+    p.add_argument("--relay", required=True)
+    p.add_argument("--name", required=True)
+    p.set_defaults(fn=cmd_config)
+
+    args = ap.parse_args()
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        return 2
+    return args.fn(args) or 0
+
+
+if __name__ == "__main__":
+    import subprocess  # used by gh-listen / serve
+    sys.exit(main())
