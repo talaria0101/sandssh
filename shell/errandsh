@@ -5,16 +5,19 @@ Sealed cages (no /dev/ptmx, no devpts, mknod denied) cannot allocate a
 kernel pty, so remote shells over them lose echo, line editing and
 signals. errandsh replaces the login shell and provides those itself:
 
-  - echo + prompt + command history with Up/Down recall
-  - Backspace, Ctrl-U (kill line), Ctrl-W (kill word), Ctrl-L (clear)
-  - Tab completion of command names (via the shell's compgen)
+  - echo + prompt + persistent command history with Up/Down recall
+  - full line editing: Left/Right/Home/End/Delete, Ctrl-A/E/B/F/K/U/W
+  - Ctrl-R reverse history search
+  - Tab completion of command names and paths
+  - bracketed-paste aware (pasted newlines don't execute)
   - Ctrl-C sends a REAL SIGINT to the running job (process group)
   - Ctrl-D / exit / logout to leave; env and cwd persist between commands
 
 Commands run in one long-lived bash, so it behaves like a normal login
 session. `errandsh -c 'cmd'` is transparent passthrough for exec channels.
 
-Environment: SANDSSH_NAME overrides the displayed hostname.
+Environment: SANDSSH_NAME overrides the displayed hostname,
+SANDSSH_HISTORY overrides the history file (default ~/.sandssh-history).
 """
 import os, sys, subprocess, signal, select, time, socket
 
@@ -23,6 +26,7 @@ NAME = (os.environ.get("SANDSSH_NAME")
         or (socket.gethostname() or "sandssh").split(".")[0])[:24]
 MARKER = "@@SANDSSH_DONE_%d_%s@@" % (os.getpid(), str(time.time()).replace(".", ""))
 MB = MARKER.encode()
+HISTFILE = os.environ.get("SANDSSH_HISTORY") or os.path.join(HOME, ".sandssh-history")
 GRN, RED, BLU, YEL, CYN, RST = ("\x1b[1;32m", "\x1b[1;31m", "\x1b[1;34m",
                                 "\x1b[0;33m", "\x1b[1;36m", "\x1b[0m")
 
@@ -40,9 +44,33 @@ bash = subprocess.Popen(
 bash.stdin.write(b"trap ':' INT\n")
 bash.stdin.flush()
 
+# ---------------------------------------------------------------- history
+
 hist, histpos = [], 0
+try:
+    with open(HISTFILE, "r", errors="replace") as f:
+        hist = [l.rstrip("\n").encode() for l in f][-500:]
+except OSError:
+    pass
+
+def hist_save(cmd):
+    try:
+        if hist and hist[-1] == cmd:
+            return
+        hist.append(cmd)
+        with open(HISTFILE, "a", errors="replace") as f:
+            f.write(cmd.decode("utf-8", "replace") + "\n")
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------- state
+
 inq = b""                # type-ahead captured while a job runs
-line, esc = b"", b""
+line = bytearray()       # input line
+pos = 0                  # cursor within line
+esc = b""                # partial escape sequence
+search = None            # ctrl-r state: query string or None
+search_idx = 0
 pend = b""                 # shell output pending marker processing
 capturing = False          # capturing output (completions) instead of printing
 captured = b""
@@ -63,7 +91,30 @@ def prompt():
     out("%s[%d]%s root@%s %s%s%s # " % (col, last_rc, RST, NAME, BLU, shortcwd(), RST))
 
 def redraw():
-    out("\r\x1b[K"); prompt(); out(line.decode("utf-8", "replace"))
+    out("\r\x1b[K"); prompt()
+    txt = line.decode("utf-8", "replace")
+    out(txt)
+    if pos < len(line):
+        out("\r\x1b[%dD" % (len(line) - pos))     # cursor back into place
+
+def redraw_search():
+    if search is None: return
+    matches = [h for h in reversed(hist) if search.encode() in h]
+    out("\r\x1b[K")
+    if not matches:
+        out("%s(rsearch)`%s`%s no match" % (CYN, search, RST))
+        return
+    global search_idx
+    search_idx = min(search_idx, len(matches) - 1)
+    m = matches[search_idx].decode("utf-8", "replace")
+    out("%s(rsearch)`%s`%s %s" % (CYN, search, RST, m))
+
+def search_accept():
+    """put the current match on the line (not executed until Enter)"""
+    matches = [h for h in reversed(hist) if search.encode() in h]
+    if matches:
+        global line, pos
+        line = bytearray(matches[search_idx]); pos = len(line)
 
 def forward(maxwait):
     """drain shell output; stream to screen, or into `captured` if capturing."""
@@ -139,7 +190,8 @@ signal.signal(signal.SIGTERM, lambda s, f: (bash.kill(), sys.exit(0)))
 out("\x1b]0;sandssh @ %s\x07" % NAME)
 out("%s== sandssh shell ==%s  userspace line discipline — no pty in this environment\r\n" % (CYN, RST))
 out("  Enter=run  Tab=complete  Ctrl-C=interrupt job  Ctrl-D/exit=leave\r\n")
-out("  Up/Down=history  Ctrl-U=kill line  Ctrl-W=kill word  Ctrl-L=clear  help=more\r\n")
+out("  Up/Down=history  Ctrl-R=search  arrows/Home/End/Delete edit the line\r\n")
+out("  Ctrl-A/E=home/end  Ctrl-K=kill fwd  Ctrl-U/W=kill line/word  Ctrl-L=clear\r\n")
 out("  uid %d; env and cwd persist between commands\r\n\r\n" % os.getuid())
 
 show_prompt = False
@@ -161,6 +213,64 @@ def next_byte():
         return c, True
     return None, False
 
+def read_more(timeout=0.05):
+    """one more byte from the type-ahead buffer or stdin"""
+    global inq, stdin_open
+    if inq:
+        c, inq = inq[:1], inq[1:]
+        return c
+    if select.select([0], [], [], timeout)[0]:
+        return os.read(0, 1)
+    return b""
+
+def handle_paste():
+    """bracketed paste: swallow until the end marker, insert without CRs"""
+    global line, pos, inq
+    chunk = b""
+    end = time.time() + 2.0
+    while time.time() < end:
+        if chunk.endswith(b"\x1b[201~"):
+            break
+        c = read_more(0.1)
+        if not c:
+            continue
+        chunk += c
+    text = chunk.replace(b"\x1b[201~", b"")
+    text = text.replace(b"\r\n", b"\n").replace(b"\r", b"")
+    # multiline pastes become one reviewable line; newlines become " ; "
+    text = text.replace(b"\n", b" ; ")
+    line[pos:pos] = text
+    pos += len(text)
+    redraw()
+
+def submit():
+    """execute the line (history + search cleanup handled here)"""
+    global line, pos, running, show_prompt
+    out("\n")
+    cmd = line.decode("utf-8", "replace").strip()
+    line, pos = bytearray(), 0
+    if cmd in ("exit", "logout", "quit"):
+        out("logout\n"); bash.stdin.close(); time.sleep(0.1); sys.exit(0)
+    if cmd == "clear":
+        out("\x1b[2J\x1b[H"); prompt(); return
+    if cmd == "history":
+        for n, h in enumerate(hist, 1): out("%4d  %s\n" % (n, h.decode()))
+        prompt(); return
+    if cmd == "help":
+        out("builtins: exit|logout|quit, clear, history, help\r\n")
+        out("keys: Tab=complete, Up/Down=history, Ctrl-R=search history,\r\n")
+        out("      Left/Right/Home/End/Delete edit, Ctrl-A/E/B/F move, Ctrl-K kill fwd,\r\n")
+        out("      Ctrl-C=interrupt job, Ctrl-U/W=kill line/word, Ctrl-L=clear, Ctrl-D=EOF\r\n")
+        out("everything else runs in bash (env + cwd persist)\r\n")
+        prompt(); return
+    if cmd == "":
+        start(":")
+        return
+    hist_save(cmd.encode())
+    global histpos
+    histpos = 0
+    start(cmd)
+
 while True:
     if not running and show_prompt:
         prompt(); show_prompt = False
@@ -168,76 +278,132 @@ while True:
     sel_r, _, _ = select.select(sources, [], [], 0.2)
     if bash.stdout in sel_r:
         forward(0.0)
+    if not running and show_prompt:
+        prompt(); show_prompt = False
     ch, live = next_byte()
     if ch is None:
         continue
     b = ch[0]
-    if b == 0x1b:                                    # escape sequence
+
+    # ---- escape sequences (arrows, home/end/delete, bracketed paste) ----
+    if b == 0x1b:
         seq = ch
         while True:
-            if len(seq) >= 3 and seq[-1] in b"@-~" and seq[1:2] == b"[":
+            if len(seq) >= 2 and seq[1:2] not in (b"[", b"O"):
+                break                       # standalone ESC (not CSI/SS3)
+            if len(seq) >= 3 and 0x40 <= seq[-1] <= 0x7e:
+                break                       # CSI final byte (@ through ~)
+            if len(seq) >= 2 and seq[-1:] == b"\x1b":
+                inq = seq[1:] + inq         # next escape: push back, redo
+                seq = b"\x1b"
                 break
-            if len(seq) >= 2 and seq[1:2] != b"[":
-                break
-            nxt = inq[:1]
-            if nxt:
-                inq = inq[1:]; seq += nxt; continue
-            if not select.select([0], [], [], 0.05)[0]: break
-            nxt = os.read(0, 1)
+            nxt = read_more(0.05)
             if not nxt: break
             seq += nxt
-        if seq == b"\x1b[A" and hist:                # Up
-            if histpos == 0: histpos = len(hist)
-            histpos = max(0, histpos - 1)
-            line = hist[histpos]; redraw()
-        elif seq == b"\x1b[B" and hist:              # Down
-            histpos = min(len(hist), histpos + 1)
-            line = hist[histpos] if histpos < len(hist) else b""
-            redraw()
-        continue                                     # ignore other escapes
+        if seq == b"\x1b[200~":
+            handle_paste(); continue
+        if search is not None:
+            if seq == b"\x1b[A":                      # up = older match
+                search_idx += 1; redraw_search(); continue
+            if seq == b"\x1b[B":                      # down = newer match
+                search_idx = max(0, search_idx - 1); redraw_search(); continue
+            search_accept(); search = None; redraw(); continue
+        if seq == b"\x1b[A":                          # Up
+            if hist: 
+                if histpos == 0: histpos = len(hist)
+                histpos = max(0, histpos - 1)
+                line = bytearray(hist[histpos]); pos = len(line); redraw()
+            continue
+        if seq == b"\x1b[B":                          # Down
+            if hist:
+                histpos = min(len(hist), histpos + 1)
+                line = bytearray(hist[histpos]) if histpos < len(hist) else bytearray()
+                pos = len(line); redraw()
+            continue
+        if seq in (b"\x1b[C",):                       # Right
+            if pos < len(line): pos += 1; out("\x1b[C")
+            continue
+        if seq in (b"\x1b[D",):                       # Left
+            if pos > 0: pos -= 1; out("\x1b[D")
+            continue
+        if seq in (b"\x1b[H", b"\x1b[1~", b"\x1bOH"): # Home
+            pos = 0; redraw()
+            continue
+        if seq in (b"\x1b[F", b"\x1b[4~", b"\x1bOF"): # End
+            pos = len(line); redraw()
+            continue
+        if seq in (b"\x1b[3~",):                      # Delete
+            if pos < len(line): del line[pos]; redraw()
+            continue
+        if seq in (b"\x1b[1;5C",):                    # Ctrl-Right: word fwd
+            while pos < len(line) and line[pos:pos+1] == b" ": pos += 1
+            while pos < len(line) and line[pos:pos+1] != b" ": pos += 1
+            redraw(); continue
+        if seq in (b"\x1b[1;5D",):                    # Ctrl-Left: word back
+            while pos > 0 and line[pos-1:pos] == b" ": pos -= 1
+            while pos > 0 and line[pos-1:pos] != b" ": pos -= 1
+            redraw(); continue
+        if seq == b"\x1b":                            # lone ESC cancels search
+            if search is not None:
+                search = None; redraw()
+        continue
+
     if running:
         if b == 0x03:
             interrupt()
         else:
             inq += ch                # type-ahead: replay at next prompt
         continue
-    if b in (0x0d, 0x0a):                            # Enter
-        out("\n")
-        cmd = line.decode("utf-8", "replace").strip()
-        line = b""
-        if cmd in ("exit", "logout", "quit"):
-            out("logout\n"); bash.stdin.close(); time.sleep(0.1); break
-        if cmd == "clear": out("\x1b[2J\x1b[H"); prompt(); continue
-        if cmd == "history":
-            for n, h in enumerate(hist, 1): out("%4d  %s\n" % (n, h.decode()))
-            prompt(); continue
-        if cmd == "help":
-            out("builtins: exit|logout|quit, clear, history, help\r\n")
-            out("keys: Tab=complete command names and paths, Up/Down=history,\r\n")
-            out("      Ctrl-C=interrupt job, Ctrl-U=kill line, Ctrl-W=kill word,\r\n")
-            out("      Ctrl-L=clear, Ctrl-D=EOF\r\n")
-            out("everything else runs in bash (env + cwd persist)\r\n")
-            prompt(); continue
-        if cmd == "":
-            start(":")
-        else:
-            hist.append(cmd.encode()); histpos = 0
-            start(cmd)
+
+    # ---- ctrl-r history search ----
+    if b == 0x12:
+        search, search_idx = "", 0
+        redraw_search(); continue
+    if search is not None:
+        if b == 0x0d or b == 0x0a:                   # Enter: accept + run
+            search_accept(); search = None
+            submit(); continue
+        if b == 0x7f or b == 0x08:                   # backspace query
+            search = search[:-1]; search_idx = 0; redraw_search(); continue
+        if b == 0x03:                                # Ctrl-C cancels
+            search = None; out("^C"); redraw(); continue
+        if b >= 0x20:
+            search += ch.decode("utf-8", "replace"); search_idx = 0
+            redraw_search(); continue
         continue
-    if b == 0x03:
-        out("^C"); prompt(); continue
-    if b == 0x04:
-        out("\nlogout\n"); break
-    if b == 0x0c:
-        out("\x1b[2J\x1b[H"); redraw(); continue
+
+    # ---- editable line ----
+    if b in (0x0d, 0x0a):                            # Enter
+        submit(); continue
+    if b == 0x01:                                    # Ctrl-A home
+        pos = 0; redraw(); continue
+    if b == 0x05:                                    # Ctrl-E end
+        pos = len(line); redraw(); continue
+    if b == 0x02:                                    # Ctrl-B left
+        if pos > 0: pos -= 1; out("\x1b[D")
+        continue
+    if b == 0x06:                                    # Ctrl-F right
+        if pos < len(line): pos += 1; out("\x1b[C")
+        continue
+    if b == 0x0b:                                    # Ctrl-K kill to end
+        del line[pos:]; redraw(); continue
     if b == 0x15:                                    # Ctrl-U kill line
-        line = b""; redraw(); continue
+        line, pos = bytearray(), 0; redraw(); continue
     if b == 0x17:                                    # Ctrl-W kill word
-        line = line.rstrip()
-        line = line[:line.rfind(b" ") + 1] if b" " in line else b""
-        redraw(); continue
+        i = pos
+        while i > 0 and line[i-1:i] == b" ": i -= 1
+        while i > 0 and line[i-1:i] not in (b" ", b""):
+            i -= 1
+        del line[i:pos]; pos = i; redraw(); continue
+    if b == 0x03:                                    # Ctrl-C (empty line)
+        out("^C"); line, pos = bytearray(), 0; prompt(); continue
+    if b == 0x04:                                    # Ctrl-D EOF
+        out("\nlogout\n"); break
+    if b == 0x0c:                                    # Ctrl-L clear
+        out("\x1b[2J\x1b[H"); redraw(); continue
     if b in (0x7f, 0x08):                            # Backspace
-        if line: line = line[:-1]; redraw()
+        if pos > 0:
+            del line[pos-1:pos]; pos -= 1; redraw()
         continue
     if b == 0x09 and not inq:                        # Tab: complete commands/paths
         toks = line.decode("utf-8", "replace").split()
@@ -249,15 +415,18 @@ while True:
         if len(comps) == 1 and comps[0]:
             base = line.decode("utf-8", "replace")
             add = comps[0] + ("/" if os.path.isdir(comps[0]) else " ")
-            line = (base[:base.rfind(tok)] + add).encode()
-            redraw()
+            rpl = base[:base.rfind(tok)] if tok else base
+            line = bytearray(rpl + add); pos = len(line); redraw()
         elif len(comps) > 1:
             pre = os.path.commonprefix(comps)
             if len(pre) > len(tok):
                 base = line.decode("utf-8", "replace")
-                line = (base[:base.rfind(tok)] + pre).encode()
+                rpl = base[:base.rfind(tok)] if tok else base
+                line = bytearray(rpl + pre); pos = len(line)
             out("\n" + "  ".join(comps[:20]) + (" ..." if len(comps) > 20 else "") + "\n")
             redraw()
         continue
     if b >= 0x20:
-        line += ch; sys.stdout.buffer.write(ch); sys.stdout.flush()
+        line[pos:pos] = ch
+        pos += 1
+        sys.stdout.buffer.write(ch); sys.stdout.flush()

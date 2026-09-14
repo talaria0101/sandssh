@@ -90,6 +90,87 @@ else
   log "shims present"
 fi
 
+# --- 3.5 sandssh CLI + relay -------------------------------------------------
+install -m 755 "$SRC/bin/sandssh"        "$SANDSSH_HOME/bin/sandssh"
+install -m 755 "$SRC/relay/sandssh-relay.py" "$SANDSSH_HOME/bin/sandssh-relay" 2>/dev/null || true
+
+# --- 3.6 dropbear (mode B server: ssh over stdio, no bind, no inbound) -------
+# dropbear -i speaks ssh on stdin/stdout, so it fits behind any outbound-only
+# transport (the wss relay). Built static so it runs chrooted without libs.
+if [ "${SANDSSH_SKIP_DROPBEAR:-0}" != "1" ] && [ ! -x "$SANDSSH_HOME/bin/dropbear" ]; then
+  if command -v go >/dev/null 2>&1 && [ "${SANDSSH_TAILCAT_STDIO:-0}" = "1" ]; then
+    log "tailcat serve-stdio requested; see docs/ -- falling back to dropbear here"
+  fi
+  DB_SRC="${DROPBEAR_SRC:-$SANDSSH_HOME/src/dropbear}"
+  if [ ! -d "$DB_SRC" ]; then
+    log "fetching dropbear (github)"
+    mkdir -p "$(dirname "$DB_SRC")"
+    git clone --depth 1 https://github.com/mkj/dropbear "$DB_SRC" || {
+      echo "could not clone dropbear; set DROPBEAR_SRC to a populated tree" >&2; }
+  fi
+  if [ -d "$DB_SRC" ]; then
+    CC_BIN="${DROPBEAR_CC:-}"
+    [ -z "$CC_BIN" ] && for c in /opt/bootlin/x86-64-musl/bin/x86_64-buildroot-linux-musl-cc \
+                              /opt/bootlin/aarch64-musl/bin/aarch64-buildroot-linux-musl-cc \
+                              cc; do
+      [ -x "$c" ] && CC_BIN="$c" && break
+    done
+    log "building dropbear (static) with $CC_BIN"
+    ( cd "$DB_SRC" && git apply "$SRC/patches/dropbear-inetd-pipe-tolerance.patch" 2>/dev/null || true
+      git apply "$SRC/patches/dropbear-setgroups-tolerance.patch" 2>/dev/null || true
+      case "$CC_BIN" in *aarch64*) HOSTTRIPLE="--host=aarch64-linux-musl";; *musl*) HOSTTRIPLE="--host=x86_64-linux-musl";; *) HOSTTRIPLE="";; esac
+      ./configure CC="$CC_BIN" $HOSTTRIPLE --disable-zlib --disable-lastlog \
+        --disable-utmp --disable-wtmp --disable-utmpx --disable-wtmpx \
+        >/dev/null 2>&1 && make -j4 STATIC=1 LDFLAGS="-static" dropbear dropbearkey \
+        >/dev/null 2>&1 && cp dropbear dropbearkey "$SANDSSH_HOME/bin/" ) \
+      && log "dropbear built" || log "dropbear build failed; mode B needs it (or set SANDSSH_DROBEAR_BIN)"
+  fi
+fi
+[ -x "$SANDSSH_HOME/bin/dropbear" ] && [ ! -f "$SANDSSH_HOME/etc/dropbear/hostkey" ] && {
+  mkdir -p "$SANDSSH_HOME/etc/dropbear"
+  "$SANDSSH_HOME/bin/dropbearkey" -t ed25519 -f "$SANDSSH_HOME/etc/dropbear/hostkey" >/dev/null 2>&1 \
+    && log "generated dropbear hostkey"
+}
+
+# --- 3.7 chroot scaffold for dropbear (passwd/shells/urandom + session shell) -
+if [ -x "$SANDSSH_HOME/bin/dropbear" ]; then
+  log "building dropbear chroot overlay at $SANDSSH_HOME"
+  mkdir -p "$SANDSSH_HOME/etc/dropbear" "$SANDSSH_HOME/dev" "$SANDSSH_HOME/root/.ssh"
+  printf 'root:x:0:0:root:/root:/bin/errandsh\n' > "$SANDSSH_HOME/etc/passwd"
+  printf 'root:x:0:\n' > "$SANDSSH_HOME/etc/group"
+  printf '/bin/errandsh\n/bin/bash\n/bin/sh\n' > "$SANDSSH_HOME/etc/shells"
+  [ -e "$SANDSSH_HOME/dev/null" ] || : > "$SANDSSH_HOME/dev/null"
+  [ -e "$SANDSSH_HOME/dev/urandom" ] || head -c 32 /dev/urandom > "$SANDSSH_HOME/dev/urandom" 2>/dev/null || true
+  ln -sfn . "$SANDSSH_HOME/usr"
+  # session shell: python3 + errandsh + their libs, so the REPL works chrooted
+  PY3="$(command -v python3 || true)"
+  if [ -n "$PY3" ] && [ ! -x "$SANDSSH_HOME/bin/python3" ]; then
+    log "installing python3 + errandsh into the chroot"
+    cp "$PY3" "$SANDSSH_HOME/bin/python3"
+    for lib in $(ldd "$PY3" | awk '{print $3}' | grep '^/'); do
+      mkdir -p "$SANDSSH_HOME$(dirname "$lib")"; cp -n "$lib" "$SANDSSH_HOME$lib" 2>/dev/null || true
+    done
+    PYSTD="$(python3 -c 'import sys; print(sys.prefix)')/lib/python3.*"
+    for d in $PYSTD; do mkdir -p "$SANDSSH_HOME/usr/lib"; cp -r "$d" "$SANDSSH_HOME/usr/lib/" 2>/dev/null || true; done
+    sed '1s|.*|#!/bin/python3|' "$SRC/shell/errandsh" > "$SANDSSH_HOME/bin/errandsh"
+    chmod 755 "$SANDSSH_HOME/bin/errandsh"
+    # bash for the REPL's long-lived job (best effort)
+    BASH_BIN="$(command -v bash || true)"
+    if [ -n "$BASH_BIN" ]; then
+      cp "$BASH_BIN" "$SANDSSH_HOME/bin/bash.real"
+      for lib in $(ldd "$BASH_BIN" | awk '{print $3}' | grep '^/'); do
+        mkdir -p "$SANDSSH_HOME$(dirname "$lib")"; cp -n "$lib" "$SANDSSH_HOME$lib" 2>/dev/null || true
+      done
+      ln -sf bash.real "$SANDSSH_HOME/bin/bash"
+    fi
+  fi
+  # authorized keys for dropbear (mode B)
+  if [ -n "${SANDSSH_AUTHORIZED_KEYS:-}" ]; then
+    printf '%s\n' "$SANDSSH_AUTHORIZED_KEYS" > "$SANDSSH_HOME/root/.ssh/authorized_keys"
+    log "installed authorized_keys from SANDSSH_AUTHORIZED_KEYS"
+  fi
+fi
+
 # --- 4. errandsh + wrappers ---------------------------------------------------
 install -m 755 "$SRC/shell/errandsh" "$SANDSSH_HOME/bin/errandsh"
 install -m 755 "$SRC/bin/ssh"        "$SANDSSH_HOME/bin/ssh" 2>/dev/null || true
@@ -121,4 +202,8 @@ fi
 touch "$SANDSSH_HOME/.ssh/authorized_keys" 2>/dev/null || true
 chmod 700 "$SANDSSH_HOME/.ssh" 2>/dev/null || true
 
-log "done. next: export TS_AUTHKEY=<tailscale-auth-key> && $SRC/start.sh"
+log "done. next:
+  mode A (tailscale):  export TS_AUTHKEY=<key> && $SRC/start.sh
+  mode B (relay):      $SRC/start.sh serve --relay wss://your-relay --name N
+  mode C (github-only): $SRC/start.sh gh
+  probe:               $SANDSSH_HOME/bin/sandssh probe" 

@@ -40,6 +40,16 @@ if ! $TS status 2>/dev/null | grep -q .; then
   log "waiting for tailscaled socket"; sleep 4
 fi
 
+# If the tailscale control plane is unreachable from this cage, say so and
+# point at the transports that DO work here instead of failing silently.
+if ! $TS status 2>/dev/null | grep -q .; then
+  log "tailscaled cannot reach control; egress to tailscale is likely blocked"
+  "$SANDSSH_HOME/bin/sandssh" probe 2>/dev/null | tail -3 || true
+  log "mode B: $0 serve --relay wss://your-relay --name $NODE_NAME"
+  log "mode C: $0 gh"
+  exit 3
+fi
+
 if [ -n "${TS_AUTHKEY:-}" ]; then
   log "joining tailnet as $NODE_NAME (ssh enabled)"
   # --ssh: inbound tailscale-ssh (exec; interactive pty is impossible in a
