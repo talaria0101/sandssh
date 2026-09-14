@@ -1,0 +1,20 @@
+#!/bin/bash
+# minimal getent stub (pure bash; the chroot has no glibc tooling):
+# tailscaled's SSH server uses getent for user/group lookup.
+db="/etc/$1"; key="$2"
+case "$1" in
+  passwd|group)
+    [ -r "$db" ] || exit 2
+    while IFS= read -r line; do
+      case "$line" in "$key:"*) echo "$line"; exit 0 ;; esac
+    done < "$db"
+    exit 1 ;;
+  initgroups)
+    uid=""
+    while IFS= read -r line; do
+      case "$line" in "$key:"*) uid="${line%%:*}"; break ;; esac
+    done < /etc/passwd
+    [ -n "$uid" ] && echo "$uid"
+    exit 0 ;;
+  *) exit 2 ;;
+esac

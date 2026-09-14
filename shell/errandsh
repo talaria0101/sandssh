@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""errandsh — a userspace line discipline for pty-less ssh sessions.
+
+Sealed cages (no /dev/ptmx, no devpts, mknod denied) cannot allocate a
+kernel pty, so remote shells over them lose echo, line editing and
+signals. errandsh replaces the login shell and provides those itself:
+
+  - echo + prompt + command history with Up/Down recall
+  - Backspace, Ctrl-U (kill line), Ctrl-W (kill word), Ctrl-L (clear)
+  - Tab completion of command names (via the shell's compgen)
+  - Ctrl-C sends a REAL SIGINT to the running job (process group)
+  - Ctrl-D / exit / logout to leave; env and cwd persist between commands
+
+Commands run in one long-lived bash, so it behaves like a normal login
+session. `errandsh -c 'cmd'` is transparent passthrough for exec channels.
+
+Environment: SANDSSH_NAME overrides the displayed hostname.
+"""
+import os, sys, subprocess, signal, select, time, socket
+
+HOME = os.environ.get("HOME", "/")
+NAME = (os.environ.get("SANDSSH_NAME")
+        or (socket.gethostname() or "sandssh").split(".")[0])[:24]
+MARKER = "@@SANDSSH_DONE_%d_%s@@" % (os.getpid(), str(time.time()).replace(".", ""))
+MB = MARKER.encode()
+GRN, RED, BLU, YEL, CYN, RST = ("\x1b[1;32m", "\x1b[1;31m", "\x1b[1;34m",
+                                "\x1b[0;33m", "\x1b[1;36m", "\x1b[0m")
+
+args = sys.argv[1:]
+if args and args[0] == "-c":
+    os.execvp("bash", ["bash", "-c", *args[1:]])
+
+bash = subprocess.Popen(
+    ["bash", "--noprofile", "--norc"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    start_new_session=True, cwd=HOME)
+
+# Non-interactive bash dies on SIGINT. Trap it so a group-wide SIGINT
+# (errandsh's Ctrl-C) kills only the foreground job, not the shell.
+bash.stdin.write(b"trap ':' INT\n")
+bash.stdin.flush()
+
+hist, histpos = [], 0
+inq = b""                # type-ahead captured while a job runs
+line, esc = b"", b""
+pend = b""                 # shell output pending marker processing
+capturing = False          # capturing output (completions) instead of printing
+captured = b""
+running = False
+show_prompt = True
+last_rc, cwd = 0, HOME
+
+def out(s):
+    sys.stdout.write(s.replace("\n", "\r\n")); sys.stdout.flush()
+
+def shortcwd():
+    if cwd == HOME: return "~"
+    if cwd.startswith(HOME + "/"): return "~" + cwd[len(HOME):]
+    return cwd
+
+def prompt():
+    col = GRN if last_rc == 0 else RED
+    out("%s[%d]%s root@%s %s%s%s # " % (col, last_rc, RST, NAME, BLU, shortcwd(), RST))
+
+def redraw():
+    out("\r\x1b[K"); prompt(); out(line.decode("utf-8", "replace"))
+
+def forward(maxwait):
+    """drain shell output; stream to screen, or into `captured` if capturing."""
+    global pend, last_rc, cwd, running, show_prompt, capturing, captured
+    r, _, _ = select.select([bash.stdout], [], [], maxwait)
+    if not r: return
+    chunk = os.read(bash.stdout.fileno(), 65536)
+    if not chunk:
+        out("\n\x1b[1;31m[shell died — closing]\x1b[0m\n"); sys.exit(0)
+    pend += chunk
+    while True:
+        i = pend.find(MB)
+        if i >= 0:
+            j = pend.find(b"\n", i)
+            if j < 0:
+                k = pend.rfind(b"\n", 0, i)
+                if k >= 0:
+                    seg, pend = pend[:k + 1], pend[k + 1:]
+                    if capturing: captured += seg
+                    else: out(seg.decode("utf-8", "replace"))
+                return
+            pre = pend[:i]
+            if pre:
+                if capturing: captured += pre
+                else: out(pre.decode("utf-8", "replace"))
+            fields = pend[i:j].decode("utf-8", "replace").strip("@").split(":", 2)
+            try: last_rc = int(fields[1])
+            except Exception: pass
+            if len(fields) > 2: cwd = fields[2]
+            pend = pend[j + 1:]
+            running = False; show_prompt = True
+            return
+        k = pend.rfind(b"\n")
+        if k < 0: return
+        seg, pend = pend[:k + 1], pend[k + 1:]
+        if capturing: captured += seg
+        else: out(seg.decode("utf-8", "replace"))
+
+def start(cmd):
+    global running, show_prompt
+    bash.stdin.write((cmd + "\n").encode())
+    bash.stdin.write(('printf "%s:%%s:%%s\\n" "$?" "$PWD"\n' % MARKER).encode())
+    bash.stdin.flush()
+    running, show_prompt = True, False
+
+def capture(cmd, timeout=3.0):
+    """run cmd silently, return its stdout lines"""
+    global capturing, captured
+    capturing, captured = True, b""
+    try:
+        bash.stdin.write((cmd + "\n").encode())
+        bash.stdin.write(('printf "%s:%%s:%%s\\n" "$?" "$PWD"\n' % MARKER).encode())
+        bash.stdin.flush()
+        end = time.time() + timeout
+        while time.time() < end:
+            forward(0.1)
+            if not running:
+                break
+    finally:
+        capturing = False
+    lines = [l for l in captured.decode("utf-8", "replace").splitlines() if l.strip()]
+    return lines
+
+def interrupt():
+    try: os.killpg(os.getpgid(bash.pid), signal.SIGINT)
+    except Exception: pass
+    out("^C")
+
+def sigint_handler(sig, frm): pass
+signal.signal(signal.SIGINT, sigint_handler)
+signal.signal(signal.SIGTERM, lambda s, f: (bash.kill(), sys.exit(0)))
+
+out("\x1b]0;sandssh @ %s\x07" % NAME)
+out("%s== sandssh shell ==%s  userspace line discipline — no pty in this environment\r\n" % (CYN, RST))
+out("  Enter=run  Tab=complete  Ctrl-C=interrupt job  Ctrl-D/exit=leave\r\n")
+out("  Up/Down=history  Ctrl-U=kill line  Ctrl-W=kill word  Ctrl-L=clear  help=more\r\n")
+out("  uid %d; env and cwd persist between commands\r\n\r\n" % os.getuid())
+
+show_prompt = False
+prompt()
+stdin_open = True
+
+def next_byte():
+    """one byte of input: replay buffered type-ahead first, then live stdin.
+    Returns (ch, live) or (None, _) when nothing is ready."""
+    global inq, stdin_open
+    if inq and not running:
+        c, inq = inq[:1], inq[1:]
+        return c, False
+    if stdin_open and sys.stdin in sel_r:
+        c = os.read(0, 1)
+        if not c:
+            stdin_open = False
+            return None, False
+        return c, True
+    return None, False
+
+while True:
+    if not running and show_prompt:
+        prompt(); show_prompt = False
+    sources = [bash.stdout] + ([sys.stdin] if stdin_open else [])
+    sel_r, _, _ = select.select(sources, [], [], 0.2)
+    if bash.stdout in sel_r:
+        forward(0.0)
+    ch, live = next_byte()
+    if ch is None:
+        continue
+    b = ch[0]
+    if b == 0x1b:                                    # escape sequence
+        seq = ch
+        while True:
+            if len(seq) >= 3 and seq[-1] in b"@-~" and seq[1:2] == b"[":
+                break
+            if len(seq) >= 2 and seq[1:2] != b"[":
+                break
+            nxt = inq[:1]
+            if nxt:
+                inq = inq[1:]; seq += nxt; continue
+            if not select.select([0], [], [], 0.05)[0]: break
+            nxt = os.read(0, 1)
+            if not nxt: break
+            seq += nxt
+        if seq == b"\x1b[A" and hist:                # Up
+            if histpos == 0: histpos = len(hist)
+            histpos = max(0, histpos - 1)
+            line = hist[histpos]; redraw()
+        elif seq == b"\x1b[B" and hist:              # Down
+            histpos = min(len(hist), histpos + 1)
+            line = hist[histpos] if histpos < len(hist) else b""
+            redraw()
+        continue                                     # ignore other escapes
+    if running:
+        if b == 0x03:
+            interrupt()
+        else:
+            inq += ch                # type-ahead: replay at next prompt
+        continue
+    if b in (0x0d, 0x0a):                            # Enter
+        out("\n")
+        cmd = line.decode("utf-8", "replace").strip()
+        line = b""
+        if cmd in ("exit", "logout", "quit"):
+            out("logout\n"); bash.stdin.close(); time.sleep(0.1); break
+        if cmd == "clear": out("\x1b[2J\x1b[H"); prompt(); continue
+        if cmd == "history":
+            for n, h in enumerate(hist, 1): out("%4d  %s\n" % (n, h.decode()))
+            prompt(); continue
+        if cmd == "help":
+            out("builtins: exit|logout|quit, clear, history, help\r\n")
+            out("keys: Tab=complete command names and paths, Up/Down=history,\r\n")
+            out("      Ctrl-C=interrupt job, Ctrl-U=kill line, Ctrl-W=kill word,\r\n")
+            out("      Ctrl-L=clear, Ctrl-D=EOF\r\n")
+            out("everything else runs in bash (env + cwd persist)\r\n")
+            prompt(); continue
+        if cmd == "":
+            start(":")
+        else:
+            hist.append(cmd.encode()); histpos = 0
+            start(cmd)
+        continue
+    if b == 0x03:
+        out("^C"); prompt(); continue
+    if b == 0x04:
+        out("\nlogout\n"); break
+    if b == 0x0c:
+        out("\x1b[2J\x1b[H"); redraw(); continue
+    if b == 0x15:                                    # Ctrl-U kill line
+        line = b""; redraw(); continue
+    if b == 0x17:                                    # Ctrl-W kill word
+        line = line.rstrip()
+        line = line[:line.rfind(b" ") + 1] if b" " in line else b""
+        redraw(); continue
+    if b in (0x7f, 0x08):                            # Backspace
+        if line: line = line[:-1]; redraw()
+        continue
+    if b == 0x09 and not inq:                        # Tab: complete commands/paths
+        toks = line.decode("utf-8", "replace").split()
+        tok = toks[-1] if toks else ""
+        if "/" in tok:
+            comps = capture('compgen -f -- "%s" 2>/dev/null | sort | head -40' % tok.replace('"', ""))
+        else:
+            comps = capture('compgen -c -- "%s" 2>/dev/null | sort -u | head -40' % tok.replace('"', ""))
+        if len(comps) == 1 and comps[0]:
+            base = line.decode("utf-8", "replace")
+            add = comps[0] + ("/" if os.path.isdir(comps[0]) else " ")
+            line = (base[:base.rfind(tok)] + add).encode()
+            redraw()
+        elif len(comps) > 1:
+            pre = os.path.commonprefix(comps)
+            if len(pre) > len(tok):
+                base = line.decode("utf-8", "replace")
+                line = (base[:base.rfind(tok)] + pre).encode()
+            out("\n" + "  ".join(comps[:20]) + (" ..." if len(comps) > 20 else "") + "\n")
+            redraw()
+        continue
+    if b >= 0x20:
+        line += ch; sys.stdout.buffer.write(ch); sys.stdout.flush()

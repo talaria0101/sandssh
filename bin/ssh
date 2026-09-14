@@ -1,0 +1,7 @@
+#!/bin/bash
+# ssh wrapper for cages with no /etc/passwd: OpenSSH refuses to run when the
+# local uid has no passwd entry, so preload the synthetic-accounts shim.
+# Everything else (keys, config) is used as-is from $HOME.
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+export LD_PRELOAD="$DIR/shims/fakepwd.so${LD_PRELOAD:+:$LD_PRELOAD}"
+exec /usr/bin/ssh "$@"

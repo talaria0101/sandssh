@@ -1,0 +1,19 @@
+diff --git a/ssh/tailssh/incubator.go b/ssh/tailssh/incubator.go
+index faf70af..8d0ae72 100644
+--- a/ssh/tailssh/incubator.go
++++ b/ssh/tailssh/incubator.go
+@@ -791,7 +791,13 @@ func doDropPrivileges(dlogf logger.Logf, wantUid, wantGid int, supplementaryGrou
+ 	}
+ 
+ 	if err := setGroups(supplementaryGroups); err != nil {
+-		return err
++		// Sandboxed hosts (seccomp-filtered) may forbid setgroups(2) even
++		// for a no-op. Tolerate the failure only when identity is not
++		// actually changing; a real drop must still hard-fail.
++		if euid != wantUid || egid != wantGid {
++			return err
++		}
++		dlogf("setgroups: %v (continuing: identity unchanged)", err)
+ 	}
+ 	if egid != wantGid {
+ 		// On FreeBSD and Darwin, we may have already called the

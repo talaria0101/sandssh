@@ -1,0 +1,4 @@
+ts-state/
+keys/
+*.private.json
+tmp/
