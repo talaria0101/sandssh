@@ -62,32 +62,38 @@ no inbound, no port forwarding, no bind permission is needed anywhere. The
 ssh session inside is end-to-end encrypted between the real peers: the
 relay only ever sees ciphertext.
 
-One-time setup: run the relay anywhere an HTTPS reverse proxy reaches:
+One-time setup: run the relay anywhere a TLS terminator can reach it
+(`relay/DEPLOY.md` has the copy-paste systemd + caddy guide):
 
 ```sh
-sandssh-relay --listen :8443 --key $SANDSSH_RELAY_KEY   # behind caddy/nginx/CF
+SANDSSH_RELAY_KEY=<secret> sandssh-relay --listen 127.0.0.1:8443
 ```
+
+The protocol is deliberately a raw byte splice (v2): no websocket framing,
+no HTTP semantics to half-parse -- after a 2-line handshake the relay moves
+opaque bytes and the ssh layer carries the real crypto. 16/16 automated
+runs green in the reference cage.
 
 Sandbox side:
 
 ```sh
-./start.sh serve --relay wss://relay.example.com --name myagent
+./start.sh serve --relay tls://relay.example.com:8443 --name myagent
 ```
 
 Laptop side (then it is just ssh):
 
 ```sh
-bin/sandssh config --relay wss://relay.example.com --name myagent >> ~/.ssh/config
+bin/sandssh config --relay tls://relay.example.com:8443 --name myagent >> ~/.ssh/config
 ssh myagent                 # native openssh session into the cage
 ssh myagent "tail -f log"   # scp/rsync/VS Code Remote-SSH style flows work
 ```
 
-Cloudflare note: a Worker-based relay for fully serverless deployment is
-planned; today `relay/sandssh-relay.py` is a stdlib python server you front
-with any TLS terminator. SNI-based censorship on the path is out of scope
-for the python client (CONNECT-allowlist cages never see SNI anyway); for
-hostile-DPI networks document composition with established tools (xray,
-hysteria) in front of `sandssh connect` via their SOCKS interface.
+`--transport ws` (websocket framing) remains available for CDN-fronted
+deployments (Cloudflare in front of the relay), but the raw relay is the
+default and the one under continuous test. SNI-based censorship on the
+path is out of scope for the python client; for hostile-DPI networks,
+compose with established tools (xray, hysteria) in front of
+`sandssh connect` via their SOCKS interface.
 
 ## Mode C: github-only cages (new)
 
@@ -104,10 +110,19 @@ bin/sandssh gh-send --name myagent --secret <secret> -- make test
 
 Commands are sequence-numbered and HMAC-signed; output is scrubbed for
 credential shapes (`tskey-`, `ghp_`, AWS keys, PEM blocks, ...) and capped
-at 14KB before it leaves the cage. Conditional GETs (ETag) keep polling
-off the rate limit. Latency is seconds per round trip: it is a control
-channel, not a shell. For interactive work in a github-only cage, the
-highest-leverage move is asking to allowlist ONE https origin for mode B.
+at 14KB before it leaves the cage. Conditional GETs (ETag) are free against
+the rate limit, connections are kept alive, and long jobs publish a rolling
+tail every 2s so output feels streaming.
+
+Interactive form: `bin/sandssh gh-shell --name agent1` on the laptop is a
+line-at-a-time remote shell. Measured round trip in the reference cage:
+2.7-5s per command (median ~3.5s). The floor is structural: every message
+is a git commit on GitHub's side (~1s per Contents PUT, two per round
+trip, plus propagation). That is the price of a github-only cage; a sub-
+second channel requires a reachable origin you control (mode B) or a
+reachable tailnet (mode A). For dev ops (run tests, tail logs, restart
+services) 3s feels like a bad satellite link, not a shell; for vim it is
+unusable -- that is physics on this network, not tuning.
 
 ## What the probe found in the reference cage
 

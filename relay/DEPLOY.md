@@ -24,16 +24,28 @@ See `sandssh-relay.service` in this directory. Listens on 127.0.0.1:8443.
 
     SANDSSH_RELAY_KEY=<key> python3 relay/sandssh-relay.py --listen 127.0.0.1:8443
 
-## 3. TLS in front (required for wss; caddy example)
+## 3. TLS in front (caddy layer4 example)
 
-    # /etc/caddy/Caddyfile
-    talaria.qaidvoid.dev {
-        reverse_proxy /sandssh/* 127.0.0.1:8443
+The v2 relay is a raw byte splice: give it its own port and let caddy
+terminate TLS on it (layer4 / tcp proxying, not the http app module):
+
+    # /etc/caddy/Caddyfile (layer4 needs the caddy-l4 plugin or nginx stream)
+    {
+        layer4 {
+            :8443 {
+                tls
+                proxy 127.0.0.1:8444
+            }
+        }
     }
+    # relay itself then listens on 127.0.0.1:8444
 
-The relay speaks plain websocket; caddy (or nginx/Cloudflare) terminates
-TLS. Any path prefix works: the relay routes on /v1/node/<name> and
-/v1/connect/<name>.
+nginx equivalent:
+
+    stream { server { listen 8443; proxy_pass 127.0.0.1:8444; } }
+    # plus certs: listen 8443 ssl;
+
+Peers then use --relay tls://talaria.qaidvoid.dev:8443.
 
 ## 4. Allowlist one line in the errand daemon's egress config
 

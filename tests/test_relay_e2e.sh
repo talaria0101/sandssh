@@ -1,7 +1,7 @@
 #!/bin/bash
 # End-to-end mode B test: ssh -> sandssh connect -> relay -> sandssh serve ->
 # dropbear -i (chroot) -> session. Runs even in bindless cages by putting the
-# relay on a unix socket (ws+unix://). Env overrides for other environments:
+# relay on a unix socket (unix:// scheme). Env overrides for other environments:
 #   SANDBOX_RELAY_SOCK, SANDBOX_DROBEAR, SANDBOX_HOSTKEY, SANDBOX_CHROOT,
 #   SANDBOX_CLIENT_KEY, SANDBOX_SSH
 set -euo pipefail
@@ -22,11 +22,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 "$SRC/relay/sandssh-relay.py" --listen "$RELAY_SOCK" --key "$SECRET" --idle-timeout 60 &
+python3 "$SRC/relay/sandssh-relay.py" --listen "$RELAY_SOCK" --key "$SECRET" &
 RELAY_PID=$!
 sleep 1
 
-python3 "$SRC/bin/sandssh" serve --relay "ws+unix://$RELAY_SOCK" --name n1 \
+python3 "$SRC/bin/sandssh" serve --relay "unix://$RELAY_SOCK" --name n1 \
     --auth "$SECRET" --dropbear "$DROPBEAR" --hostkey "$HOSTKEY" --chroot "$CHROOT" &
 NODE_PID=$!
 sleep 2
@@ -34,6 +34,6 @@ sleep 2
 timeout 60 "$SSH_BIN" -i "$CLIENTKEY" \
     -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
     -o PasswordAuthentication=no \
-    -o ProxyCommand="python3 $SRC/bin/sandssh connect --relay ws+unix://$RELAY_SOCK --name n1 --auth $SECRET" \
+    -o ProxyCommand="python3 $SRC/bin/sandssh connect --relay "unix://$RELAY_SOCK" --name n1 --auth $SECRET" \
     -o ConnectTimeout=30 \
     root@n1 "echo hello-over-relay && uname -s"

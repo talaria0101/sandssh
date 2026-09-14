@@ -1,218 +1,199 @@
 #!/usr/bin/env python3
-"""sandssh-relay -- rendezvous relay for sandssh mode B.
+"""sandssh-relay -- raw rendezvous relay for sandssh mode B.
 
-Both the sandbox node and the ssh client DIAL OUT to this relay; it pairs
-the two and becomes a dumb ciphertext pipe. It exists to solve "no inbound,
-no bind" cages: nothing behind it listens, everything is outbound TLS.
+Both the sandbox node and the ssh client dial OUT; the relay pairs the two
+connections and splices raw bytes. The ssh session inside is end-to-end
+encrypted between the real peers, so the relay is a dumb ciphertext pipe:
+the simpler it is, the fewer ways it can stall.
 
-Run it anywhere an HTTPS reverse proxy can reach (caddy/nginx/Cloudflare in
-front of it), or expose it directly with --tls-cert/--tls-key:
+Protocol (v2, plain bytes after TCP/TLS -- no websocket layer):
 
-    sandssh-relay --listen :8443 --key <shared-secret>
-    sandssh-relay --listen /tmp/relay.sock --key <shared-secret>   # testing
+    node:   connect, send "SANDSSH1 n <name>\\n<key>\\n"   -> waits
+    client: connect, send "SANDSSH1 c <name>\\n<key>\\n"   -> pairs
 
-Protocol (v1), after a websocket handshake:
+    relay answers each side with "OK\\n", then splices bytes until EOF.
+    Unknown/failed handshakes get "ERR <reason>\\n" and a close.
 
-    node:   GET /v1/node/<name>     header X-SandSSH-Key: <secret>
-    client: GET /v1/connect/<name>  header X-SandSSH-Key: <secret>
+Deploy behind a TLS terminator (caddy layer4 / nginx stream) on any port
+the cage's egress policy allows, or expose directly with --tls-cert/--tls-key.
+A unix socket path makes it testable in bindless cages.
 
-The relay queues up to --queue node dials per name; a client connect pops
-one and sends b"ok" to both ends, then forwards raw websocket bytes between
-them. It never reads the frames: the ssh session inside is end-to-end
-encrypted between the real peers, so the relay can be dumb and untrusted.
-
-Stdlib only. Test it without any bind permission by using a unix socket.
+    sandssh-relay --listen :8443 --key <secret>
+    sandssh-relay --listen /tmp/relay.sock --key <secret>     # testing
 """
 import argparse, hmac, os, socket, ssl, sys, threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_QUEUE = 4
-MAX_CONNS = 64
+MAX_IDLE = 900            # seconds an unpaired node dial is held
 
 state_lock = threading.Lock()
-pending = {}            # name -> [ws-conn objects]
-conn_count = [0]
+pending = {}              # name -> [(conn, paired_event, done_event)]
 
 
 def log(msg):
-    print("[relay] %s" % msg, flush=True)
+    print("[relay %s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
 
 
-class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    rbufsize = 0        # unbuffered: never read past the handshake into frames
-    wbufsize = 0
+import time
 
-    def log_message(self, fmt, *args):
-        pass
 
-    def plain(self, code, text):
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(text)))
-        self.end_headers()
-        self.wfile.write(text)
+def recv_line(conn):
+    """read one \\n-terminated line (max 512)"""
+    buf = b""
+    while b"\n" not in buf:
+        c = conn.recv(256)
+        if not c:
+            raise ConnectionError("closed during handshake")
+        buf += c
+        if len(buf) > 512:
+            raise ConnectionError("handshake line too long")
+    line, buf2 = buf.split(b"\n", 1)
+    # any bytes after the first line belong to the stream; push them back is
+    # impossible on a socket -- the protocol requires the peer to send the
+    # handshake as its first write and WAIT for OK before ssh bytes, so
+    # leftover data here means a protocol violation.
+    if buf2:
+        raise ConnectionError("unexpected data after handshake line")
+    return line.decode("latin1").rstrip("\r")
 
-    def do_GET(self):
-        key = self.headers.get("X-SandSSH-Key", "")
-        want = self.server.relay_key
-        if not want or not hmac.compare_digest(key, want):
-            self.plain(401, "sandssh-relay: bad or missing X-SandSSH-Key\n")
-            return
-        parts = self.path.split("/")
-        if len(parts) < 4 or parts[1] != "v1":
-            self.plain(404, "sandssh-relay: not found\n"); return
-        role, name = parts[2], parts[3]
-        if not name.replace("-", "").replace("_", "").isalnum() or len(name) > 64:
-            self.plain(400, "sandssh-relay: bad node name\n"); return
 
-        if role == "node":
-            self.register_node(name)
-        elif role == "connect":
-            self.connect_client(name)
-        else:
-            self.send_response(404); self.end_headers()
+def handle(conn):
+    buf = bytearray()
+    def rline():
+        nonlocal buf
+        while b"\n" not in buf:
+            c = conn.recv(4096)
+            if not c:
+                raise ConnectionError("closed during handshake")
+            buf += c
+            if len(buf) > 1024:
+                raise ConnectionError("handshake too long")
+        ln, buf = buf.split(b"\n", 1)
+        return ln.decode("latin1").rstrip("\r")
+    try:
+        line = rline()
+    except ConnectionError:
+        conn.close(); return
+    parts = line.split(" ")
+    if len(parts) != 3 or parts[0] != "SANDSSH1" or parts[1] not in ("n", "c"):
+        conn.sendall(b"ERR bad handshake\n"); conn.close(); return
+    role, name = parts[1], parts[2]
+    try:
+        key = rline()
+    except ConnectionError:
+        conn.close(); return
+    if not hmac.compare_digest(key, SERVER_KEY):
+        conn.sendall(b"ERR bad key\n"); conn.close(); return
+    if not name.replace("-", "").replace("_", "").isalnum() or len(name) > 64:
+        conn.sendall(b"ERR bad name\n"); conn.close(); return
 
-    # -- websocket handshake helpers --------------------------------------
-
-    def ws_accept_key(self):
-        import base64, hashlib
-        key = self.headers.get("Sec-WebSocket-Key", "")
-        if not key:
-            return None
-        return base64.b64encode(hashlib.sha1(
-            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-
-    def finish_upgrade(self):
-        acc = self.ws_accept_key()
-        if acc is None:
-            self.send_response(400); self.end_headers(); return False
-        self.connection.sendall(("HTTP/1.1 101 Switching Protocols\r\n"
-                                 "Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                                 "Sec-WebSocket-Accept: %s\r\n\r\n" % acc).encode())
-        return True
-
-    # -- roles -------------------------------------------------------------
-
-    def register_node(self, name):
-        if not self.finish_upgrade():
-            return
-        ev = threading.Event()      # set when a client pairs with us
-        done = threading.Event()    # set when the pipe is finished
+    if role == "n":
+        ev, done = threading.Event(), threading.Event()
         with state_lock:
             q = pending.setdefault(name, [])
-            while len(q) >= self.server.queue:
-                dropped = q.pop(0)
-                try:
-                    dropped[0].close(); dropped[2].set()
-                except OSError: pass
-            q.append((self.connection, ev, done))
-        # hold open WITHOUT reading (the pipe owns the socket once paired);
-        # after pairing, hold until the pipe is done -- returning early would
-        # let the HTTP handler close the socket under the pipe.
-        if not ev.wait(timeout=self.server.idle_timeout):
+            while len(q) >= MAX_QUEUE:
+                _, _, d0 = q.pop(0)
+                d0.set()
+            q.append((conn, ev, done))
+        log("node %s waiting" % name)
+        if not ev.wait(timeout=MAX_IDLE):
             with state_lock:
                 q = pending.get(name, [])
-                if (self.connection, ev, done) in q:
-                    q.remove((self.connection, ev, done))
-            try: self.connection.close()
+                if (conn, ev, done) in q:
+                    q.remove((conn, ev, done))
+            try: conn.close()
             except OSError: pass
             return
-        done.wait()
+        done.wait()            # keep the socket until the splice is over
+        return
 
-    def connect_client(self, name):
-        with state_lock:
-            q = pending.get(name, [])
-            entry = q.pop(0) if q else None
-        if entry is None:
-            self.plain(503, "sandssh-relay: node not connected; try again\n")
-            return
-        node, ev, done = entry
-        if not self.finish_upgrade():
-            try: node.close()
-            except OSError: pass
-            done.set()
-            return
-        with state_lock:
-            pending.get(name, []).clear()
-        # wake both ends: relay sends b"ok" as first frame to each
-        for s in (node, self.connection):
-            try:
-                s.sendall(b"\x81\x02ok")      # FIN+text, len 2, "ok" (server: unmasked)
-            except OSError:
-                pass
-        log("paired client with node %s" % name)
-        ev.set()
-        try:
-            pipe(node, self.connection)
-        finally:
-            done.set()
+    # client
+    with state_lock:
+        q = pending.get(name, [])
+        entry = q.pop(0) if q else None
+    if entry is None:
+        conn.sendall(b"ERR node not connected; retry\n"); conn.close(); return
+    node, ev, done = entry
+    conn.sendall(b"OK\n")
+    node.sendall(b"OK\n")
+    ev.set()
+    log("paired client with node %s" % name)
+    try:
+        splice(node, conn)
+    finally:
+        done.set()
 
 
-def pipe(a, b, tag=""):
-    """Forward raw bytes both ways until either side closes."""
-    import os as _os
-    dbg = bool(_os.environ.get("SANDSSH_RELAY_DEBUG"))
-    stats = [0, 0]
-    conns = [a, b]
-    def one_way(src, dst, i):
+def splice(a, b):
+    def one_way(src, dst, name):
         try:
             while True:
                 d = src.recv(65536)
                 if not d:
-                    if dbg: log("pipe%s[%d] eof after %d bytes" % (tag, i, stats[i]))
                     break
-                stats[i] += len(d)
-                if dbg: log("pipe%s[%d] +%d" % (tag, i, len(d)))
                 dst.sendall(d)
-        except OSError as e:
-            if dbg: log("pipe%s[%d] err %s after %d bytes" % (tag, i, e, stats[i]))
+        except OSError:
+            pass
         try: dst.shutdown(socket.SHUT_WR)
         except OSError: pass
-    t = threading.Thread(target=one_way, args=(a, b, 0), daemon=True)
-    t2 = threading.Thread(target=one_way, args=(b, a, 1), daemon=True)
-    t.start(); t2.start()
-    t.join(); t2.join()
-    for s in conns:
+    t1 = threading.Thread(target=one_way, args=(a, b, "n>c"), daemon=True)
+    t2 = threading.Thread(target=one_way, args=(b, a, "c>n"), daemon=True)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    for s in (a, b):
         try: s.close()
         except OSError: pass
 
 
-class UnixThreadingHTTPServer(ThreadingHTTPServer):
-    address_family = socket.AF_UNIX
-    def server_bind(self):
-        try: os.unlink(self.server_address)
+SERVER_KEY = ""
+
+
+class RawServer:
+    def __init__(self, sock):
+        self.sock = sock
+
+    def serve_forever(self):
+        while True:
+            conn, _ = self.sock.accept()
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+
+class UnixRawServer(RawServer):
+    def __init__(self, path):
+        try: os.unlink(path)
         except OSError: pass
-        super().server_bind()
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.bind(path)
+        s.listen(16)
+        super().__init__(s)
 
 
 def main():
+    global SERVER_KEY
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", required=True, help="host:port or /unix/path")
-    ap.add_argument("--key", default=os.environ.get("SANDSSH_RELAY_KEY", ""),
-                    help="shared secret (X-SandSSH-Key); required")
-    ap.add_argument("--queue", type=int, default=MAX_QUEUE)
-    ap.add_argument("--idle-timeout", type=int, default=900,
-                    help="seconds an unpaired node dial is held")
+    ap.add_argument("--key", default=os.environ.get("SANDSSH_RELAY_KEY", ""))
     ap.add_argument("--tls-cert", default=None)
     ap.add_argument("--tls-key", default=None)
     args = ap.parse_args()
     if not args.key:
         sys.exit("refusing to run without --key/SANDSSH_RELAY_KEY")
+    SERVER_KEY = args.key
 
     if args.listen.startswith("/"):
-        srv = UnixThreadingHTTPServer(args.listen, Handler)
+        srv = UnixRawServer(args.listen)
     else:
         host, port = args.listen.rsplit(":", 1)
-        srv = ThreadingHTTPServer((host, int(port)), Handler)
-    srv.relay_key = args.key
-    srv.queue = max(1, min(args.queue, 16))
-    srv.idle_timeout = args.idle_timeout
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, int(port)))
+        s.listen(16)
+        srv = RawServer(s)
     if args.tls_cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(args.tls_cert, args.tls_key)
-        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
-    log("listening on %s (queue %d)" % (args.listen, srv.queue))
+        srv.sock = ctx.wrap_socket(srv.sock, server_side=True)
+    log("listening on %s" % args.listen)
     srv.serve_forever()
 
 
