@@ -85,9 +85,13 @@ transport.
 `ws_probe.py` proves WebSocket upgrade works through the allowed
 port.
 
-- wss://ws.postman-echo.com:443/raw gives 101 Switching Protocols.
-- wss://relay.damus.io:443/ gives 503 Service Unavailable (reachable,
-  no WS at /). CONNECT and TLS succeed.
+- wss://ws.postman-echo.com:443/raw gives 101 Switching Protocols
+  (stable across 3 runs on 2026-09-26).
+- wss://relay.damus.io:443/ changed during the day: 503 Service
+  Unavailable at 13:12Z, 101 Switching Protocols on 2 control runs
+  at 13:44Z. The origin is reachable either way (CONNECT and TLS
+  succeed); what it serves at / is its own state, so treat a 101
+  here as relay behaviour that can flip back, not a stable fact.
 - echo.websocket.events:443 fails at proxy DNS (502 name did not
   resolve). Observed, not inferred.
 
