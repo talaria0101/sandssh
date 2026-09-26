@@ -4,7 +4,22 @@ Proves: CONNECT to WSS host:443 via egress proxy, TLS, WS upgrade 101.
 Run: timeout 25 python3 ws_probe.py
 """
 import socket, ssl, os, base64
-PROXY=("169.254.169.1",44163)
+def _egress():
+    for v in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        u = os.environ.get(v, "")
+        if "://" in u:
+            u = u.split("://", 1)[1]
+        u = u.rstrip("/")
+        if not u:
+            continue
+        if ":" in u:
+            h, p = u.rsplit(":", 1)
+            try:
+                return (h, int(p))
+            except ValueError:
+                continue
+    return ("169.254.169.1", 44163)
+PROXY = _egress()
 def tunnel(h,p,timeout=5):
     s=socket.create_connection(PROXY,timeout=timeout)
     s.settimeout(timeout)

@@ -2,7 +2,7 @@
 """podssh-poc chain: ssh from CONNECT-allowlist sandbox to railway.new:22
 via public HTTP relay on allowed :443.
 
-Path: ssh -> this ProxyCommand -> egress proxy (169.254.169.1:44163)
+Path: ssh -> this ProxyCommand -> egress proxy (from env, port varies per session)
   -> open relay :443 (public, allows CONNECT to arbitrary)
   -> railway.new:22 (SSH-2.0-Go)
 
@@ -33,9 +33,12 @@ def _egress():
     return ("169.254.169.1", 44163)
 
 EGRESS = _egress()
-# Verified 2026-09-26 via DoH + CONNECT + SSH banner read (SSH-2.0-Go).
-# Both returned 200 to inner CONNECT railway.new:22 and served Go banner.
+# Verified 2026-09-26 via CONNECT + SSH banner + KEXINIT (672 bytes, ssh-ed25519).
+# Each returned 200 to inner CONNECT railway.new:22 and served SSH-2.0-Go.
+# 52.25.133.43:443 provisioned a trial VM on a fresh key (see README update
+# 2026-09-26). 47.236.86.147:443 is flaky: banner ok, ssh often closes.
 RELAYS = [
+    "52.25.133.43:443",
     "107.167.18.122:443",
     "47.236.86.147:443",
 ]

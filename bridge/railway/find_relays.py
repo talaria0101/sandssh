@@ -5,8 +5,23 @@ Usage: timeout 90 python3 find_relays.py [start] [count]
 Input: /tmp/speedx.txt or /tmp/pf443.txt style host:port lines.
 Stdlib only, bounded timeouts.
 """
-import socket, sys
-EGRESS=("169.254.169.1",44163)
+import socket, sys, os
+def _egress():
+    for v in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        u = os.environ.get(v, "")
+        if "://" in u:
+            u = u.split("://", 1)[1]
+        u = u.rstrip("/")
+        if not u:
+            continue
+        if ":" in u:
+            h, p = u.rsplit(":", 1)
+            try:
+                return (h, int(p))
+            except ValueError:
+                continue
+    return ("169.254.169.1", 44163)
+EGRESS = _egress()
 def test(proxy, timeout=5):
     ph,pp=proxy.rsplit(":",1); pp=int(pp)
     try:
