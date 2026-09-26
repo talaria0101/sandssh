@@ -1,0 +1,13 @@
+Host: railway.new
+HostName railway.new
+Port 22
+User root
+IdentityFile /state/home/.ssh/id_ed25519
+StrictHostKeyChecking no
+UserKnownHostsFile /dev/null
+ConnectTimeout 15
+ServerAliveInterval 10
+ServerAliveCountMax 2
+ProxyCommand python3 /workspace/podssh-poc/chain.py
+# Sandbox needs passwd shim for ssh itself (no /etc/passwd, uid 0):
+#   LD_PRELOAD=/tmp/sandssh/shims/fakepwd.so ssh railway.new
