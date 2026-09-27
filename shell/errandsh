@@ -77,7 +77,8 @@ set -u
 # `dash -c "echo $'\033'"` prints a literal, not an escape.
 keep() { _v=$(printf "$1x"); _v=${_v%x}; }
 
-keep '\033'; ESC_ESC=$_v      # ESC
+keep '\033'; ES=$_v            # the escape byte
+ESC_ESC=$ES                     # the name the key loop reads
 keep '\003'; ESC_ETX=$_v      # Ctrl-C
 keep '\004'; ESC_EOT=$_v      # Ctrl-D
 keep '\001'; ESC_A=$_v        # Ctrl-A, home
@@ -92,6 +93,20 @@ keep '\177'; BRK=$_v          # DEL, which is what Backspace sends
 keep '\r';   CR=$_v
 keep '\n';   NL=$_v
 keep '\t';   TAB=$_v
+keep '\133'; ESC_BRACKET=$_v   # '[', which no control name covers
+# The letters the escape sequences are built from, and the two `~` forms a
+# terminal sends for Home/End/Delete. They are variables rather than literals
+# because they sit next to a raw ESC, and a raw ESC in source is invisible in
+# an editor, which is how a reviewer misses a change to it.
+keep 'A';  A=$_v
+keep 'B';  B=$_v
+keep 'C';  C_=$_v
+keep 'D';  D=$_v
+keep 'F';  F=$_v
+keep 'H';  H=$_v
+keep '1';  ONE_TILDE="$_v~"
+keep '3';  THREE_TILDE="$_v~"
+keep '4';  FOUR_TILDE="$_v~"
 SP=' '
 
 # A self-check, because every one of these being empty is silent and fatal, and
@@ -256,6 +271,15 @@ hist_save() {
     # A repeated command is not appended twice, which is what makes Up/Down
     # useful rather than a way to reach the same line six times.
     if printf '%s\n' "$HIST" | grep -Fxq -- "$1" 2>/dev/null; then
+        # ⛔ THE POSITION IS RESET EVEN WHEN NOTHING IS APPENDED. A repeated
+        # command returns early here, and the first version of this function
+        # left HPOS where it was, so after a duplicate HPOS pointed one past
+        # the end and Up skipped the newest entry. The measurement: `cd -` is
+        # a repeat of nothing but `cd /tmp` is not, and the sequence
+        # `cd /tmp`, `cd -`, Up landed on the wrong line in both dash and
+        # bash. HPOS is "where in history am I", and running a command moves
+        # you to the end of it whether or not it was new.
+        HPOS=$((HCOUNT + 1))
         return 0
     fi
     HIST="$HIST
@@ -634,22 +658,56 @@ while :; do
         # A bare ESC is the start of a sequence. Hold it and take the next
         # byte, and drop the pair if the second byte is not a bracket, which
         # is what a real ESC key press looks like.
-        if [ -z "$ESC" ]; then
-            if [ "$C" = "$ESC_ESC" ]; then
-                ESC=1
+        # ⛔ THE ESCAPE SEQUENCE IS ACCUMULATED AND DECIDED ONLY WHEN IT IS
+        # COMPLETE, AND THAT IS THE BUG THIS REPLACES. The first two versions
+        # branched on whether the PREVIOUS byte was an escape, so the dispatch
+        # ran on the SECOND byte: an Up key arrives as 1b 5b 41, ESC was set
+        # on the 1b, and the comparison was handed "1b 5b" with the 41 still
+        # unread. Nothing matched, and the A was then inserted as text. The
+        # measurement that pinned it: a trace of the compare showed
+        # ESCN=1b5b while C=5b and the A had not been read yet.
+        #
+        # So: collect bytes into $ESCN until one of the known sequences
+        # matches, a terminator arrives, or the bound below is hit. A bound is
+        # not optional, because a peer that sends ESC and then nothing would
+        # otherwise hang the session on a sequence that never completes.
+        if [ "$C" = "$ESC_ESC" ]; then
+            ESCN=$ESC_ESC
+            ESCN_N=1
+            ESC_GOT=
+        elif [ -n "${ESCN:-}" ]; then
+            ESCN="$ESCN$C"
+            ESCN_N=$(( ${ESCN_N:-0} + 1 ))
+            ESC_GOT=1
+        fi
+
+        if [ -n "${ESCN:-}" ]; then
+            case_done=0
+            if   [ "$ESCN" = "$ES$ESC_BRACKET$A" ];   then hist_prev; redraw; case_done=1
+            elif [ "$ESCN" = "$ES$ESC_BRACKET$B" ];   then hist_next; redraw; case_done=1
+            elif [ "$ESCN" = "$ES$ESC_BRACKET$C_" ]; then
+                [ "$POS" -le "${#LINE}" ] && { POS=$((POS + 1)); redraw; }; case_done=1
+            elif [ "$ESCN" = "$ES$ESC_BRACKET$D" ];   then
+                [ "$POS" -gt 1 ] && { POS=$((POS - 1)); redraw; }; case_done=1
+            elif [ "$ESCN" = "$ES$ESC_BRACKET$H" ] || [ "$ESCN" = "$ES$ESC_BRACKET$ONE_TILDE" ]; then
+                POS=1; redraw; case_done=1
+            elif [ "$ESCN" = "$ES$ESC_BRACKET$F" ] || [ "$ESCN" = "$ES$ESC_BRACKET$FOUR_TILDE" ]; then
+                POS=$((${#LINE} + 1)); redraw; case_done=1
+            elif [ "$ESCN" = "$ES$ESC_BRACKET$THREE_TILDE" ]; then
+                del_at; redraw; case_done=1
+            elif [ ${ESCN_N:-0} -ge 6 ]; then
+                # An unknown or unfinished sequence, and six bytes is more than
+                # any terminal sends for a key this file knows. Swallowing it
+                # is right: inserting the bytes would put the operator's
+                # terminal's private sequences into their command line.
+                case_done=1
+            else
+                # Incomplete: wait for the next byte.
                 continue
             fi
-        else
-            case "$ESC$C" in
-                '[A') hist_prev; redraw; ESC=''; continue ;;
-                '[B') hist_next; redraw; ESC=''; continue ;;
-                '[C') [ "$POS" -le "${#LINE}" ] && { POS=$((POS + 1)); redraw; }; ESC=''; continue ;;
-                '[D') [ "$POS" -gt 1 ] && { POS=$((POS - 1)); redraw; }; ESC=''; continue ;;
-                '[H'|'[1~') POS=1; redraw; ESC=''; continue ;;
-                '[F'|'[4~') POS=$((${#LINE} + 1)); redraw; ESC=''; continue ;;
-                '[3~') del_at; redraw; ESC=''; continue ;;
-                *) ESC=''; continue ;;
-            esac
+            ESCN=
+            ESCN_N=0
+            continue
         fi
 
         case "$C" in
