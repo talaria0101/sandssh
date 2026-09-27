@@ -5,3 +5,4 @@ tmp/
 sand-state/
 __pycache__/
 *.pyc
+.work/

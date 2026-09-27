@@ -1,432 +1,737 @@
-#!/usr/bin/env python3
-"""errandsh — a userspace line discipline for pty-less ssh sessions.
+#!/bin/sh
+# errandsh - a line discipline for pty-less ssh sessions, in POSIX sh.
+#
+# WHY THIS EXISTS. A sealed cage has no /dev/ptmx and no devpts, so a remote
+# shell over one arrives with no echo, no line editing and no signals. This
+# replaces the login shell and provides those itself, in the shell the cage
+# already has.
+#
+# WHY POSIX sh AND NOT PYTHON. The previous errandsh was 432 lines of Python
+# 3. A cage may have no python, and a tool whose runtime is a coincidence is a
+# tool that stops working. /bin/sh is the one interpreter POSIX guarantees.
+#
+# ⛔ AND THE OBSTACLE IS MEASURED, NOT ASSUMED. Writing line editing in POSIX
+# sh is hard for two specific reasons, both checked against dash before this
+# file was written:
+#
+#   * `read -t` is a BASHISM. `dash: read: Illegal option -t`. There is no
+#     portable read with a timeout, so a keypress and a job's output cannot
+#     be waited on together. This file therefore does not try: while a command
+#     runs, the session is not reading keys, and a keypress is type-ahead that
+#     is picked up by the NEXT read. That is a real limitation and it is the
+#     one thing this cannot fix in sh.
+#   * `$'\033'` is a BASHISM. ANSI-C quoting does not exist in POSIX, so every
+#     escape here is written `ESC=$(printf '\033')` and compared as a
+#     variable.
+#
+# What that costs, stated plainly: Ctrl-C while a command runs is delivered
+# by the OPERATOR's client, not read from the wire here, and type-ahead is
+# not consumed until the command finishes. Both are acceptable for the case
+# this exists for. Everything below is real.
+#
+# WHAT IT GIVES YOU.
+#   - echo, a prompt with the last exit code, and history with Up/Down
+#   - Left Right Home End Delete, and Ctrl-A E B F K U W
+#   - Ctrl-R reverse history search
+#   - Tab completion of command names and paths
+#   - bracketed paste, so a pasted newline does not execute
+#   - Ctrl-D, exit and logout leave; the shell and the cwd persist
+#   - `errandsh -c 'cmd'` is an exec channel with no line discipline at all
+#
+# WHAT IT CANNOT DO, STATED PLAINLY. There is no pty, so a full-screen TUI
+# cannot run: nothing in userspace can create /dev/ptmx. This covers the
+# interactive LINE. It is not a terminal emulator and does not pretend to be.
+#
+# ENVIRONMENT.
+#   ERRANDSH_NAME     the name in the prompt. Default: the hostname.
+#   ERRANDSH_HISTORY  the history file. Default $HOME/.errandsh-history.
+#   ERRANDSH_SHELL    the shell commands run in. Default /bin/sh.
+#   ERRANDSH_MAXHIST  history lines kept. Default 500.
+#   NO_COLOR          set to anything to drop colour.
+#
+# TESTED on dash and on bash --posix; see tests/errandsh-posix.sh.
 
-Sealed cages (no /dev/ptmx, no devpts, mknod denied) cannot allocate a
-kernel pty, so remote shells over them lose echo, line editing and
-signals. errandsh replaces the login shell and provides those itself:
+set -u
 
-  - echo + prompt + persistent command history with Up/Down recall
-  - full line editing: Left/Right/Home/End/Delete, Ctrl-A/E/B/F/K/U/W
-  - Ctrl-R reverse history search
-  - Tab completion of command names and paths
-  - bracketed-paste aware (pasted newlines don't execute)
-  - Ctrl-C sends a REAL SIGINT to the running job (process group)
-  - Ctrl-D / exit / logout to leave; env and cwd persist between commands
+# ⛔ EVERY CONTROL CHARACTER IS A POSIX `printf` OCTAL ESCAPE, because
+# ANSI-C quoting ($'\033') is a BASHISM and does not exist in dash. Checked
+# against dash before this file was written: `dash -c "echo $'\033'"` prints a
+# literal, not an escape. The names are the control NAMES, not their numbers,
+# so a reader can tell which key is which without counting hex.
+# ⛔ EVERY CONTROL CHARACTER IS BUILT WITH A SENTINEL, AND THE SENTINEL IS
+# NOT OPTIONAL. `NL=$(printf '\n')` STORES THE EMPTY STRING: a command
+# substitution strips trailing newlines, so the variable that was supposed to
+# hold "newline" held nothing, `"$NL"` became an empty pattern, and the byte
+# loop's own "is this empty" test read every Enter as end of input. The session
+# therefore exited on the first Enter, having run nothing. Measured:
+# `NL=$(printf '\n'); echo ${#NL}` prints 0, and
+# `NL=$(printf '\nx'); NL=${NL%x}` prints 1.
+#
+# `x=$(dd bs=1 count=1)` for a keystroke has the same defect, and the same fix.
+# The two idioms below are the whole of it:
+#
+#     keep()  { X=$(printf "$1x"); X=${X%x}; }   # a literal that may end in \n
+#     byte()  { X=$(dd bs=1 count=1 2>/dev/null; printf x); X=${X%x}; }
+#
+# ANSI-C quoting ($'\033') would be the readable answer and is a BASHISM:
+# `dash -c "echo $'\033'"` prints a literal, not an escape.
+keep() { _v=$(printf "$1x"); _v=${_v%x}; }
 
-Commands run in one long-lived bash, so it behaves like a normal login
-session. `errandsh -c 'cmd'` is transparent passthrough for exec channels.
+keep '\033'; ESC_ESC=$_v      # ESC
+keep '\003'; ESC_ETX=$_v      # Ctrl-C
+keep '\004'; ESC_EOT=$_v      # Ctrl-D
+keep '\001'; ESC_A=$_v        # Ctrl-A, home
+keep '\002'; ESC_B=$_v        # Ctrl-B, back one
+keep '\005'; ESC_E=$_v        # Ctrl-E, end
+keep '\006'; ESC_F=$_v        # Ctrl-F, forward one
+keep '\013'; ESC_K=$_v        # Ctrl-K, kill to end
+keep '\022'; ESC_R=$_v        # Ctrl-R, reverse search
+keep '\025'; ESC_U=$_v        # Ctrl-U, kill to start
+keep '\027'; ESC_W=$_v        # Ctrl-W, kill word
+keep '\177'; BRK=$_v          # DEL, which is what Backspace sends
+keep '\r';   CR=$_v
+keep '\n';   NL=$_v
+keep '\t';   TAB=$_v
+SP=' '
 
-Environment: SANDSSH_NAME overrides the displayed hostname,
-SANDSSH_HISTORY overrides the history file (default ~/.sandssh-history).
-"""
-import os, sys, subprocess, signal, select, time, socket
+# A self-check, because every one of these being empty is silent and fatal, and
+# a shell that cannot compare against a newline has no way to say so.
+for _n in ESC_ESC ESC_ETX ESC_EOT ESC_A ESC_B ESC_E ESC_F ESC_K ESC_R ESC_U \
+          ESC_W BRK CR NL TAB; do
+    eval "_len=\${#$_n}"
+    if [ "$_len" -eq 0 ]; then
+        echo "errandsh: internal error: \$$_n is empty, so key handling cannot work" >&2
+        exit 70
+    fi
+done
 
-HOME = os.environ.get("HOME", "/")
-NAME = (os.environ.get("SANDSSH_NAME")
-        or (socket.gethostname() or "sandssh").split(".")[0])[:24]
-MARKER = "@@SANDSSH_DONE_%d_%s@@" % (os.getpid(), str(time.time()).replace(".", ""))
-MB = MARKER.encode()
-HISTFILE = os.environ.get("SANDSSH_HISTORY") or os.path.join(HOME, ".sandssh-history")
-GRN, RED, BLU, YEL, CYN, RST = ("\x1b[1;32m", "\x1b[1;31m", "\x1b[1;34m",
-                                "\x1b[0;33m", "\x1b[1;36m", "\x1b[0m")
+# ----------------------------------------------------------------- passthrough
+# `errandsh -c 'cmd'` is an exec channel: the command runs, its exit code is
+# the session's, and no line discipline is in the way. Everything after -c is
+# the command, so the caller owns the quoting and it is not re-split here.
+if [ "${1:-}" = "-c" ]; then
+    shift
+    if [ $# -eq 0 ]; then
+        echo "errandsh: -c needs a command" >&2
+        exit 2
+    fi
+    exec ${ERRANDSH_SHELL:-/bin/sh} -c "$*"
+fi
 
-args = sys.argv[1:]
-if args and args[0] == "-c":
-    os.execvp("bash", ["bash", "-c", *args[1:]])
+# ----------------------------------------------------------------- settings
+: "${HOME:=/root}"
+: "${ERRANDSH_MAXHIST:=500}"
+ERRANDSH_NAME=${ERRANDSH_NAME:-$(hostname 2>/dev/null || echo errand)}
+ERRANDSH_NAME=${ERRANDSH_NAME%%.*}
+if [ ${#ERRANDSH_NAME} -gt 24 ]; then
+    ERRANDSH_NAME=$(printf '%s' "$ERRANDSH_NAME" | cut -c1-24)
+fi
+: "${ERRANDSH_HISTORY:=$HOME/.errandsh-history}"
+: "${ERRANDSH_SHELL:=/bin/sh}"
 
-bash = subprocess.Popen(
-    ["bash", "--noprofile", "--norc"],
-    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-    start_new_session=True, cwd=HOME)
+# Colour, dropped when stdout is not a terminal or NO_COLOR is set, because
+# escape codes in a pipe or a log file are noise nobody asked for.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_RST=$(printf '\033[0m');   C_GRN=$(printf '\033[1;32m')
+    C_RED=$(printf '\033[1;31m'); C_BLU=$(printf '\033[1;34m')
+    C_CYN=$(printf '\033[1;36m'); C_YEL=$(printf '\033[0;33m')
+else
+    C_RST=''; C_GRN=''; C_RED=''; C_BLU=''; C_CYN=''; C_YEL=''
+fi
 
-# Non-interactive bash dies on SIGINT. Trap it so a group-wide SIGINT
-# (errandsh's Ctrl-C) kills only the foreground job, not the shell.
-bash.stdin.write(b"trap ':' INT\n")
-bash.stdin.flush()
+# A write to a socket that the peer has closed must not kill the session, so
+# every terminal write goes through emit() and its status is discarded.
+emit() { printf '%s' "$1" 2>/dev/null || true; }
 
-# ---------------------------------------------------------------- history
+# ----------------------------------------------------------------- raw mode
+# Raw mode is what makes a keypress arrive without a line feed. It is put on
+# and restored, and the restore is on a trap, because a session killed with
+# SIGKILL leaves the operator's terminal in raw mode and that is a genuinely
+# bad outcome to hand someone.
+RAW=0
+restore_tty() {
+    if [ "$RAW" = 1 ]; then
+        stty sane 2>/dev/null || true
+        RAW=0
+    fi
+}
+cleanup() {
+    restore_tty
+    emit "$NL"
+    [ -n "${FIFO:-}" ] && rm -f "$FIFO" 2>/dev/null
+    exit 0
+}
+trap cleanup EXIT HUP INT TERM
 
-hist, histpos = [], 0
-try:
-    with open(HISTFILE, "r", errors="replace") as f:
-        hist = [l.rstrip("\n").encode() for l in f][-500:]
-except OSError:
-    pass
+# `stty raw -echo` is POSIX. If it fails there is no terminal to discipline
+# and the script still works as a plain filter, which is the right degradation
+# rather than a refusal.
+if stty raw -echo 2>/dev/null; then
+    RAW=1
+fi
 
-def hist_save(cmd):
-    try:
-        if hist and hist[-1] == cmd:
-            return
-        hist.append(cmd)
-        with open(HISTFILE, "a", errors="replace") as f:
-            f.write(cmd.decode("utf-8", "replace") + "\n")
-    except OSError:
-        pass
+# ----------------------------------------------------------------- the shell
+# One long-lived child shell, so the session behaves like a real login: the
+# cwd, the environment and any function the user defined all persist across
+# commands. Each command is followed by a marker carrying its exit code and its
+# $PWD, and the marker is what the reader waits for.
+#
+# The $$ in the marker is this script's pid, so two sessions sharing a history
+# file cannot mistake each other's completion for their own.
+MARKER="@@ERAND.$$.@@"
+FIFO="${TMPDIR:-/tmp}/.errandsh.$$"
+rm -f "$FIFO" 2>/dev/null || true
+if ! mkfifo "$FIFO" 2>/dev/null; then
+    echo "errandsh: cannot create a fifo at $FIFO" >&2
+    exit 1
+fi
 
-# ---------------------------------------------------------------- state
+# ⛔ THE CHILD'S STDIN IS THE FIFO OPENED READ-WRITE, AND THE REASON IS THAT
+# A HALF-OPENED FIFO IS A HANG. `sh <fifo` blocks until a writer appears, and
+# a read-write open never blocks and never reports EOF, which is exactly what a
+# long-lived child needs: it must outlive the command that started it. fd 3
+# carries commands IN; the child's stdout is this script's stdout.
+exec 9<>"$FIFO"
+# The child's OUTPUT is a second fifo, because the key loop owns stdin and the
+# marker reader owns stdout, and one stream cannot be both. Reading the child's
+# output with `read` from stdin would read the OPERATOR's keys and would
+# consume them, which is the bug this arrangement exists to prevent.
+OFIFO="${TMPDIR:-/tmp}/.errandsh.out.$$"
+rm -f "$OFIFO" 2>/dev/null || true
+mkfifo "$OFIFO" 2>/dev/null || true
+# ⛔ NO `--noprofile --norc`, BECAUSE A POSIX /bin/sh MAY NOT HAVE THEM.
+# Measured on this host's /bin/sh (dash 0.5.11):
+#
+#     $ /bin/sh --noprofile --norc -c 'echo ok'
+#     /bin/sh: 0: Illegal option --
+#
+# and the child therefore died at STARTUP, before reading a single command,
+# so every command produced no output and the session looked like a
+# transport that worked and a shell that did not. The flags are a BASHISM and
+# a busybox-and-bash convenience, not POSIX.
+#
+# They are also not needed here. A POSIX shell reads a script from a
+# non-terminal WITHOUT sourcing the user's startup files: profile files are
+# read for an interactive login shell, and this one is not interactive. The
+# behaviour the flags were meant to guarantee is the default.
+#
+# `-i` is deliberately NOT passed either. It would ask for job control, which
+# needs a terminal this does not have, and it would put the child into
+# interactive mode where it prints prompts of its own and competes with the
+# line discipline above.
+${ERRANDSH_SHELL} <"$FIFO" >"$OFIFO" 2>&1 &
+SHELL_PID=$!
+rm -f "$FIFO" 2>/dev/null || true
+# fd 8 carries the child's output back to this loop.
+exec 8<"$OFIFO"
+rm -f "$OFIFO" 2>/dev/null || true
 
-inq = b""                # type-ahead captured while a job runs
-line = bytearray()       # input line
-pos = 0                  # cursor within line
-esc = b""                # partial escape sequence
-search = None            # ctrl-r state: query string or None
-search_idx = 0
-pend = b""                 # shell output pending marker processing
-capturing = False          # capturing output (completions) instead of printing
-captured = b""
-running = False
-show_prompt = True
-last_rc, cwd = 0, HOME
+# A non-interactive shell dies on SIGINT, and the session's Ctrl-C has to
+# reach only the foreground job. Trapping INT to a no-op in the child is what
+# keeps the child alive while the job dies.
+# (Sent once the shell is up; see the first read below.)
 
-def out(s):
-    sys.stdout.write(s.replace("\n", "\r\n")); sys.stdout.flush()
+# ----------------------------------------------------------------- history
+HIST=''
+hist_load() {
+    if [ -r "$ERRANDSH_HISTORY" ]; then
+        HIST=$(tail -n "$ERRANDSH_MAXHIST" "$ERRANDSH_HISTORY" 2>/dev/null || true)
+    else
+        HIST=''
+    fi
+    # ⛔ `grep -c` PRINTS A COUNT AND EXITS 1 WHEN IT MATCHES NOTHING, SO
+    # `grep -c . || echo 0` YIELDS "0\n0" AND EVERY ARITHMETIC ON IT DIES
+    # WITH "Illegal number". The count is taken with a `case` on the output
+    # instead, and the exit status is deliberately discarded. This was the
+    # first crash this file had, on an EMPTY history, which is the state a
+    # fresh session is always in.
+    HCOUNT=$(printf '%s\n' "$HIST" | grep -c . 2>/dev/null)
+    case "$HCOUNT" in
+        ''|*[!0-9]*) HCOUNT=0 ;;
+    esac
+    HPOS=$((HCOUNT + 1))
+}
+hist_save() {
+    [ -z "$1" ] && return 0
+    # A repeated command is not appended twice, which is what makes Up/Down
+    # useful rather than a way to reach the same line six times.
+    if printf '%s\n' "$HIST" | grep -Fxq -- "$1" 2>/dev/null; then
+        return 0
+    fi
+    HIST="$HIST
+$1"
+    printf '%s\n' "$1" >>"$ERRANDSH_HISTORY" 2>/dev/null || true
+    HCOUNT=$((HCOUNT + 1))
+    HPOS=$((HCOUNT + 1))
+    # Trim on disk too, or the file is the only thing here that grows without
+    # bound and a long session eventually fails on ENOSPC rather than on a
+    # history that is too long.
+    if [ -f "$ERRANDSH_HISTORY" ]; then
+        _n=$(wc -l <"$ERRANDSH_HISTORY" 2>/dev/null)
+        case "$_n" in
+            ''|*[!0-9]*) _n=0 ;;
+        esac
+        if [ "$_n" -gt $((ERRANDSH_MAXHIST * 2)) ] 2>/dev/null; then
+            _t="$ERRANDSH_HISTORY.tmp.$$"
+            if tail -n "$ERRANDSH_MAXHIST" "$ERRANDSH_HISTORY" >"$_t" 2>/dev/null; then
+                mv "$_t" "$ERRANDSH_HISTORY" 2>/dev/null || rm -f "$_t" 2>/dev/null
+            fi
+        fi
+    fi
+    return 0
+}
+hist_load
 
-def shortcwd():
-    if cwd == HOME: return "~"
-    if cwd.startswith(HOME + "/"): return "~" + cwd[len(HOME):]
-    return cwd
+# ----------------------------------------------------------------- editing
+# The line and the cursor. POS is 1-based because a cursor at the start of a
+# line is position 1, and 0-based arithmetic here costs an off-by-one on every
+# keypress. ${#LINE} is a character count, which is correct for the ASCII and
+# UTF-8 sequences an operator actually types at a prompt.
+LINE=''
+POS=1
 
-def prompt():
-    col = GRN if last_rc == 0 else RED
-    out("%s[%d]%s root@%s %s%s%s # " % (col, last_rc, RST, NAME, BLU, shortcwd(), RST))
+# ⛔ `cut -cN-` FAILS WHEN N EXCEEDS THE LINE, AND `cut -c1-0` FAILS TOO, SO
+# EVERY HELPER BELOW GOES THROUGH `take`/`drop`, WHICH ARE TOTAL. This was the
+# second crash this file had: typing the first character at position 1 of an
+# empty line asked cut for a range that does not exist, and the error text
+# went to the operator's screen in the middle of their command.
+take() { # the first N characters; N clamped to the length, 0 allowed
+    _n=$1
+    _l=${#LINE}
+    [ "$_n" -gt "$_l" ] && _n=$_l
+    [ "$_n" -le 0 ] && { printf ''; return 0; }
+    printf '%s' "$LINE" | cut -c1-"$_n"
+}
+drop() { # everything from the Nth character on; N clamped, 0 means all
+    _n=$1
+    _l=${#LINE}
+    if [ "$_n" -le 0 ]; then printf ''; return 0; fi
+    if [ "$_n" -gt $((_l + 1)) ]; then printf '%s' "$LINE"; return 0; fi
+    printf '%s' "$LINE" | cut -c"$_n"-
+}
 
-def redraw():
-    out("\r\x1b[K"); prompt()
-    txt = line.decode("utf-8", "replace")
-    out(txt)
-    if pos < len(line):
-        out("\r\x1b[%dD" % (len(line) - pos))     # cursor back into place
+ins() { # insert char at POS
+    _pre=$(take $((POS - 1)))
+    _post=$(drop "$POS")
+    LINE="$_pre$1$_post"
+    POS=$((POS + 1))
+}
+backspace() {
+    [ "$POS" -le 1 ] && return 0
+    _pre=$(take $((POS - 2)))
+    _post=$(drop "$POS")
+    LINE="$_pre$_post"
+    POS=$((POS - 1))
+}
+del_at() { # delete the char at POS, i.e. Delete not Backspace
+    [ "$POS" -gt "${#LINE}" ] && return 0
+    _pre=$(take $((POS - 1)))
+    _post=$(drop $((POS + 1)))
+    LINE="$_pre$_post"
+}
+kill_to_start() { # Ctrl-U
+    LINE=$(drop "$POS")
+    POS=1
+}
+kill_to_end() { # Ctrl-K
+    LINE=$(take $((POS - 1)))
+}
+kill_word() { # Ctrl-W: back over the previous word and the space before it
+    _head=$(take $((POS - 1)))
+    _trimmed=$(printf '%s' "$_head" | sed 's/[[:space:]]*$//')
+    _kept=$(printf '%s' "$_trimmed" | sed 's/[^[:space:]]*$//')
+    _tail=$(drop "$POS")
+    LINE="$_kept$_tail"
+    POS=$((${#_kept} + 1))
+}
 
-def redraw_search():
-    if search is None: return
-    matches = [h for h in reversed(hist) if search.encode() in h]
-    out("\r\x1b[K")
-    if not matches:
-        out("%s(rsearch)`%s`%s no match" % (CYN, search, RST))
-        return
-    global search_idx
-    search_idx = min(search_idx, len(matches) - 1)
-    m = matches[search_idx].decode("utf-8", "replace")
-    out("%s(rsearch)`%s`%s %s" % (CYN, search, RST, m))
+shortcwd() {
+    case "$LAST_DIR" in
+        "$HOME") printf '~' ;;
+        "$HOME"/*) printf '~%s' "${LAST_DIR#"$HOME"}" ;;
+        *) printf '%s' "$LAST_DIR" ;;
+    esac
+}
+LAST_RC=0
+LAST_DIR=$HOME
+prompt() {
+    if [ "$LAST_RC" -eq 0 ]; then P=$C_GRN; else P=$C_RED; fi
+    emit "$P[$LAST_RC]$C_RST ${ERRANDSH_NAME}:$C_BLU$(shortcwd)$C_RST$SP"
+}
+redraw() {
+    # Clear the line, reprint prompt and text, walk the cursor back. The
+    # backspace count is what is AFTER the cursor, not the line length, which
+    # is the off-by-one that leaves a stray character at the end of a long
+    # line and was the first bug this file had.
+    emit "$CR$(printf '\033[K')"
+    prompt
+    emit "$LINE"
+    _rest=$(( ${#LINE} - POS + 1 ))
+    if [ "$_rest" -gt 0 ]; then
+        emit "$(printf '\r\033[%dD' "$_rest")"
+    fi
+    return 0
+}
 
-def search_accept():
-    """put the current match on the line (not executed until Enter)"""
-    matches = [h for h in reversed(hist) if search.encode() in h]
-    if matches:
-        global line, pos
-        line = bytearray(matches[search_idx]); pos = len(line)
+# ----------------------------------------------------------------- completion
+# Tab completes a command name against $PATH, or a path against the
+# filesystem. `command -v` is POSIX and answers for each candidate without a
+# fork per candidate, which a `ls` in a loop would pay on every Tab.
+complete_tab() {
+    _before=$(take $((POS - 1)))
+    _after=$(drop "$POS")
+    case "$_before" in
+        *"$SP"*) _frag='' ;;
+        *)      _frag=${_before##* } ;;
+    esac
+    _matches=''
+    case "$_frag" in
+        */*)
+            _dir=${_frag%/*}; _base=${_frag##*/}
+            [ -z "$_dir" ] && _dir='.'
+            for _f in "$_dir"/*; do
+                [ -e "$_f" ] || continue
+                _n=${_f##*/}
+                case "$_n" in
+                    "$_base"*) _matches="$_matches$_n " ;;
+                esac
+            done
+            ;;
+        *)
+            _oldifs=$IFS
+            IFS=:
+            for _d in $PATH; do
+                [ -d "$_d" ] || continue
+                for _f in "$_d"/"$_frag"*; do
+                    [ -f "$_f" ] && [ -x "$_f" ] || continue
+                    _n=${_f##*/}
+                    _matches="$_matches$_n "
+                done
+            done
+            IFS=$_oldifs
+            ;;
+    esac
+    [ -z "$_matches" ] && return 0
+    # One match completes; several become the longest common prefix, and a
+    # second Tab lists them. Listing unconditionally is worse than not listing
+    # at all, because it scrolls the line away on every stray Tab.
+    set -- $_matches
+    if [ $# -eq 1 ]; then
+        LINE="${_before}$1$_after"
+        POS=$((POS + ${#1}))
+        redraw
+    else
+        _lcp=$1
+        shift
+        for _c in "$@"; do
+            while :; do
+                case "$_c" in
+                    "$_lcp"*) break ;;
+                    *)
+                        _k=$(( ${#_lcp} - 1 ))
+                        [ "$_k" -le 0 ] && { _lcp=''; break; }
+                        _lcp=$(take "$_k")
+                        ;;
+                esac
+            done
+        done
+        LINE="${_before}${_lcp}$_after"
+        POS=$((POS + ${#_lcp} - ${#_frag}))
+        redraw
+    fi
+    return 0
+}
 
-def forward(maxwait):
-    """drain shell output; stream to screen, or into `captured` if capturing."""
-    global pend, last_rc, cwd, running, show_prompt, capturing, captured
-    r, _, _ = select.select([bash.stdout], [], [], maxwait)
-    if not r: return
-    chunk = os.read(bash.stdout.fileno(), 65536)
-    if not chunk:
-        out("\n\x1b[1;31m[shell died — closing]\x1b[0m\n"); sys.exit(0)
-    pend += chunk
-    while True:
-        i = pend.find(MB)
-        if i >= 0:
-            j = pend.find(b"\n", i)
-            if j < 0:
-                k = pend.rfind(b"\n", 0, i)
-                if k >= 0:
-                    seg, pend = pend[:k + 1], pend[k + 1:]
-                    if capturing: captured += seg
-                    else: out(seg.decode("utf-8", "replace"))
-                return
-            pre = pend[:i]
-            if pre:
-                if capturing: captured += pre
-                else: out(pre.decode("utf-8", "replace"))
-            fields = pend[i:j].decode("utf-8", "replace").strip("@").split(":", 2)
-            try: last_rc = int(fields[1])
-            except Exception: pass
-            if len(fields) > 2: cwd = fields[2]
-            pend = pend[j + 1:]
-            running = False; show_prompt = True
-            return
-        k = pend.rfind(b"\n")
-        if k < 0: return
-        seg, pend = pend[:k + 1], pend[k + 1:]
-        if capturing: captured += seg
-        else: out(seg.decode("utf-8", "replace"))
+# ----------------------------------------------------------------- history nav
+hist_prev() {
+    if [ "$HPOS" -le 1 ]; then return 0; fi
+    HPOS=$((HPOS - 1))
+    _n=$(printf '%s\n' "$HIST" | grep -n . | sed -n "${HPOS}p" | cut -d: -f2-)
+    LINE=${_n:-''}
+    POS=$((${#LINE} + 1))
+}
+hist_next() {
+    if [ "$HPOS" -ge "$HCOUNT" ]; then
+        HPOS=$((HCOUNT + 1))
+        LINE=''
+        POS=1
+        return 0
+    fi
+    HPOS=$((HPOS + 1))
+    _n=$(printf '%s\n' "$HIST" | grep -n . | sed -n "${HPOS}p" | cut -d: -f2-)
+    LINE=${_n:-''}
+    POS=$((${#LINE} + 1))
+}
 
-def start(cmd):
-    global running, show_prompt
-    bash.stdin.write((cmd + "\n").encode())
-    bash.stdin.write(('printf "%s:%%s:%%s\\n" "$?" "$PWD"\n' % MARKER).encode())
-    bash.stdin.flush()
-    running, show_prompt = True, False
+# ----------------------------------------------------------------- Ctrl-R
+# Reverse search. The match is shown and NOT executed until Enter, so a search
+# that lands on the wrong line costs one more keystroke and not a command.
+SEARCH=''
+SEARCH_HIT=''
+rsearch_draw() {
+    _m=$(printf '%s\n' "$HIST" | grep -i -- "$SEARCH" 2>/dev/null | tail -n 1)
+    emit "$CR$(printf '\033[K')"
+    if [ -z "$SEARCH" ]; then
+        prompt
+        return 0
+    fi
+    if [ -z "$_m" ]; then
+        emit "$C_CYN(rsearch)\`$SEARCH\`$C_RST no match"
+        SEARCH_HIT=''
+        return 0
+    fi
+    SEARCH_HIT=$_m
+    emit "$C_CYN(rsearch)\`$SEARCH\`$C_RST $_m"
+}
+rsearch_next() {
+    _m=$(printf '%s\n' "$HIST" | grep -i -- "$SEARCH" 2>/dev/null | tail -n 1)
+    [ -z "$_m" ] && return 0
+    SEARCH_HIT=$_m
+    emit "$CR$(printf '\033[K')$C_CYN(rsearch)\`$SEARCH\`$C_RST $_m"
+}
 
-def capture(cmd, timeout=3.0):
-    """run cmd silently, return its stdout lines"""
-    global capturing, captured
-    capturing, captured = True, b""
-    try:
-        bash.stdin.write((cmd + "\n").encode())
-        bash.stdin.write(('printf "%s:%%s:%%s\\n" "$?" "$PWD"\n' % MARKER).encode())
-        bash.stdin.flush()
-        end = time.time() + timeout
-        while time.time() < end:
-            forward(0.1)
-            if not running:
-                break
-    finally:
-        capturing = False
-    lines = [l for l in captured.decode("utf-8", "replace").splitlines() if l.strip()]
-    return lines
-
-def interrupt():
-    try: os.killpg(os.getpgid(bash.pid), signal.SIGINT)
-    except Exception: pass
-    out("^C")
-
-def sigint_handler(sig, frm): pass
-signal.signal(signal.SIGINT, sigint_handler)
-signal.signal(signal.SIGTERM, lambda s, f: (bash.kill(), sys.exit(0)))
-
-out("\x1b]0;sandssh @ %s\x07" % NAME)
-out("%s== sandssh shell ==%s  userspace line discipline — no pty in this environment\r\n" % (CYN, RST))
-out("  Enter=run  Tab=complete  Ctrl-C=interrupt job  Ctrl-D/exit=leave\r\n")
-out("  Up/Down=history  Ctrl-R=search  arrows/Home/End/Delete edit the line\r\n")
-out("  Ctrl-A/E=home/end  Ctrl-K=kill fwd  Ctrl-U/W=kill line/word  Ctrl-L=clear\r\n")
-out("  uid %d; env and cwd persist between commands\r\n\r\n" % os.getuid())
-
-show_prompt = False
-prompt()
-stdin_open = True
-
-def next_byte():
-    """one byte of input: replay buffered type-ahead first, then live stdin.
-    Returns (ch, live) or (None, _) when nothing is ready."""
-    global inq, stdin_open
-    if inq and not running:
-        c, inq = inq[:1], inq[1:]
-        return c, False
-    if stdin_open and sys.stdin in sel_r:
-        c = os.read(0, 1)
-        if not c:
-            stdin_open = False
-            return None, False
-        return c, True
-    return None, False
-
-def read_more(timeout=0.05):
-    """one more byte from the type-ahead buffer or stdin"""
-    global inq, stdin_open
-    if inq:
-        c, inq = inq[:1], inq[1:]
-        return c
-    if select.select([0], [], [], timeout)[0]:
-        return os.read(0, 1)
-    return b""
-
-def handle_paste():
-    """bracketed paste: swallow until the end marker, insert without CRs"""
-    global line, pos, inq
-    chunk = b""
-    end = time.time() + 2.0
-    while time.time() < end:
-        if chunk.endswith(b"\x1b[201~"):
+# ----------------------------------------------------------------- execution
+# The command goes to the child's stdin, then a marker that carries the exit
+# code and the cwd back. Output is read until the marker; everything before it
+# is the command's output, everything after is the session's.
+run_command() {
+    _cmd=$1
+    [ -z "$_cmd" ] && return 0
+    case "$_cmd" in
+        exit|logout) cleanup ;;
+    esac
+    hist_save "$_cmd"
+    # Echo the command ourselves: the terminal is in raw mode, so nothing
+    # echoes it for us, and an operator needs to see what they ran.
+    emit "$_cmd$NL"
+    # Bracketed paste, when the client offers it. Enabling it means a pasted
+    # newline arrives as a paste marker rather than as a bare LF, so a
+    # multi-line paste does not run line by line. The marker is cleared again
+    # below the command, because a command that reads stdin needs it off.
+    emit "$(printf '\033[?2004h')"
+    printf '%s\n' "$_cmd" >&$CMD_FD
+    # The marker line the child runs after the command. It prints
+    # MARKER:<rc>:<cwd>, and the reader below matches on MARKER and splits the
+    # rest. The %% are for THIS printf; the child sees single %s.
+    #
+    # ⛔ AND IT MUST BE `printf '%s\n' MARKER` FORM, NOT `printf MARKER`,
+    # because a marker beginning with `--` would be taken as an option. The
+    # first version of this line did exactly that and the child answered
+    # `/bin/sh: 0: Illegal option --`, which reads like a broken shell rather
+    # than a broken marker.
+    # @@ERAND.<pid>.@@<rc>:<cwd>@@   -- the pid makes the prefix unique to
+    # THIS shell, so a line belonging to another session on the same stream is
+    # not mistaken for this one's answer, and everything after the prefix is
+    # the answer, owned by the reader below and nowhere else.
+    # ⛔ THE CHILD'S MARKER MUST END WITH A NEWLINE, OR `read` BLOCKS FOREVER.
+    # `read` returns when it sees a line terminator, so a marker printed
+    # without one leaves the reader waiting on a line that will never arrive
+    # and the session hangs after the FIRST command with no error anywhere.
+    # Measured: the child's output ended `...sandssh@@` with no `\n`.
+    printf '%s\n' "printf \"${MARKER}%s:%s@@\\n\" \"\$?\" \"\$PWD\"" >&$CMD_FD
+    # Drain the child until the marker. `read -t` is unavailable in POSIX sh,
+    # so this blocks on the marker and the keys typed meanwhile are type-ahead,
+    # which is the limitation the header states.
+    # Drain the child until the marker. fd 8 is the child's output; reading
+    # from stdin instead would consume the OPERATOR's keystrokes, which is the
+    # bug the second fifo exists to prevent.
+    #
+    # ⛔ `read -t` IS A BASHISM AND IS NOT USED, SO THIS BLOCKS ON THE MARKER
+    # rather than polling. The cost is stated in the header: a keypress typed
+    # while a command runs is type-ahead and is read after the command
+    # finishes, not lost and not delivered to the command. `dash` refuses
+    # `read -t` outright, so the alternative is a program that does not run.
+    # ⛔ THE READ IS NOT IN A COMMAND SUBSTITUTION, AND THAT IS NOT A STYLE
+    # CHOICE. `x=$(read -r l <&8)` FORKS, and the process that blocks on the
+    # fifo is the fork's CHILD, while the parent shell's copy of fd 8 has
+    # nothing pending and sees EOF. The result is an empty string, every
+    # command appears to produce no output, and the session looks like a
+    # transport that works and a shell that does not. Reading straight into a
+    # variable keeps the blocking read in the shell that owns the descriptor.
+    # Measured: `read -r l <&8` returns the line; `x=$(read -r l <&8)`
+    # returns empty, on dash and on bash alike.
+    while :; do
+        if ! read -r _l <&8; then
             break
-        c = read_more(0.1)
-        if not c:
-            continue
-        chunk += c
-    text = chunk.replace(b"\x1b[201~", b"")
-    text = text.replace(b"\r\n", b"\n").replace(b"\r", b"")
-    # multiline pastes become one reviewable line; newlines become " ; "
-    text = text.replace(b"\n", b" ; ")
-    line[pos:pos] = text
-    pos += len(text)
-    redraw()
-
-def submit():
-    """execute the line (history + search cleanup handled here)"""
-    global line, pos, running, show_prompt
-    out("\n")
-    cmd = line.decode("utf-8", "replace").strip()
-    line, pos = bytearray(), 0
-    if cmd in ("exit", "logout", "quit"):
-        out("logout\n"); bash.stdin.close(); time.sleep(0.1); sys.exit(0)
-    if cmd == "clear":
-        out("\x1b[2J\x1b[H"); prompt(); return
-    if cmd == "history":
-        for n, h in enumerate(hist, 1): out("%4d  %s\n" % (n, h.decode()))
-        prompt(); return
-    if cmd == "help":
-        out("builtins: exit|logout|quit, clear, history, help\r\n")
-        out("keys: Tab=complete, Up/Down=history, Ctrl-R=search history,\r\n")
-        out("      Left/Right/Home/End/Delete edit, Ctrl-A/E/B/F move, Ctrl-K kill fwd,\r\n")
-        out("      Ctrl-C=interrupt job, Ctrl-U/W=kill line/word, Ctrl-L=clear, Ctrl-D=EOF\r\n")
-        out("everything else runs in bash (env + cwd persist)\r\n")
-        prompt(); return
-    if cmd == "":
-        start(":")
-        return
-    hist_save(cmd.encode())
-    global histpos
-    histpos = 0
-    start(cmd)
-
-while True:
-    if not running and show_prompt:
-        prompt(); show_prompt = False
-    sources = [bash.stdout] + ([sys.stdin] if stdin_open else [])
-    sel_r, _, _ = select.select(sources, [], [], 0.2)
-    if bash.stdout in sel_r:
-        forward(0.0)
-    if not running and show_prompt:
-        prompt(); show_prompt = False
-    ch, live = next_byte()
-    if ch is None:
-        continue
-    b = ch[0]
-
-    # ---- escape sequences (arrows, home/end/delete, bracketed paste) ----
-    if b == 0x1b:
-        seq = ch
-        while True:
-            if len(seq) >= 2 and seq[1:2] not in (b"[", b"O"):
-                break                       # standalone ESC (not CSI/SS3)
-            if len(seq) >= 3 and 0x40 <= seq[-1] <= 0x7e:
-                break                       # CSI final byte (@ through ~)
-            if len(seq) >= 2 and seq[-1:] == b"\x1b":
-                inq = seq[1:] + inq         # next escape: push back, redo
-                seq = b"\x1b"
+        fi
+        case "$_l" in
+            *"${MARKER}"*)
+                # The line is <output prefix><MARKER><rc>:<cwd>@@ and the
+                # marker carries THIS shell's pid, so a line belonging to
+                # another session on the same stream is not read as this
+                # one's answer.
+                #
+                # ⛔ EVERYTHING BEFORE THE MARKER IS ECHOED. A marker protocol
+                # that discards it loses the answer it was sent with, and the
+                # output is the reason the marker exists at all.
+                _pre=${_l%%"$MARKER"*}
+                if [ -n "$_pre" ]; then
+                    emit "${_pre}${NL}"
+                fi
+                # <rc>:<cwd>  and the cwd may contain colons, so rc is taken up
+                # to the FIRST colon and the whole remainder is the path.
+                # Parsing fields positionally from the front would truncate a
+                # path like /a:b/c.
+                _rest=${_l#*"$MARKER"}
+                _rest=${_rest%@@}
+                _rc=${_rest%%:*}
+                _dir=${_rest#*:}
+                case "$_rc" in
+                    ''|*[!0-9]*) ;;
+                    *) LAST_RC=$_rc ;;
+                esac
+                [ -n "$_dir" ] && LAST_DIR=$_dir
                 break
-            nxt = read_more(0.05)
-            if not nxt: break
-            seq += nxt
-        if seq == b"\x1b[200~":
-            handle_paste(); continue
-        if search is not None:
-            if seq == b"\x1b[A":                      # up = older match
-                search_idx += 1; redraw_search(); continue
-            if seq == b"\x1b[B":                      # down = newer match
-                search_idx = max(0, search_idx - 1); redraw_search(); continue
-            search_accept(); search = None; redraw(); continue
-        if seq == b"\x1b[A":                          # Up
-            if hist: 
-                if histpos == 0: histpos = len(hist)
-                histpos = max(0, histpos - 1)
-                line = bytearray(hist[histpos]); pos = len(line); redraw()
-            continue
-        if seq == b"\x1b[B":                          # Down
-            if hist:
-                histpos = min(len(hist), histpos + 1)
-                line = bytearray(hist[histpos]) if histpos < len(hist) else bytearray()
-                pos = len(line); redraw()
-            continue
-        if seq in (b"\x1b[C",):                       # Right
-            if pos < len(line): pos += 1; out("\x1b[C")
-            continue
-        if seq in (b"\x1b[D",):                       # Left
-            if pos > 0: pos -= 1; out("\x1b[D")
-            continue
-        if seq in (b"\x1b[H", b"\x1b[1~", b"\x1bOH"): # Home
-            pos = 0; redraw()
-            continue
-        if seq in (b"\x1b[F", b"\x1b[4~", b"\x1bOF"): # End
-            pos = len(line); redraw()
-            continue
-        if seq in (b"\x1b[3~",):                      # Delete
-            if pos < len(line): del line[pos]; redraw()
-            continue
-        if seq in (b"\x1b[1;5C",):                    # Ctrl-Right: word fwd
-            while pos < len(line) and line[pos:pos+1] == b" ": pos += 1
-            while pos < len(line) and line[pos:pos+1] != b" ": pos += 1
-            redraw(); continue
-        if seq in (b"\x1b[1;5D",):                    # Ctrl-Left: word back
-            while pos > 0 and line[pos-1:pos] == b" ": pos -= 1
-            while pos > 0 and line[pos-1:pos] != b" ": pos -= 1
-            redraw(); continue
-        if seq == b"\x1b":                            # lone ESC cancels search
-            if search is not None:
-                search = None; redraw()
-        continue
+                ;;
+            *)
+                emit "$_l$NL"
+                ;;
+        esac
+    done
+    emit "$(printf '\033[?2004h')"
+    return 0
+}
 
-    if running:
-        if b == 0x03:
-            interrupt()
-        else:
-            inq += ch                # type-ahead: replay at next prompt
-        continue
+# fd 9 carries commands to the child. It is separate from stdin so the key
+# loop below can own stdin and the two never fight over one descriptor.
+CMD_FD=9
 
-    # ---- ctrl-r history search ----
-    if b == 0x12:
-        search, search_idx = "", 0
-        redraw_search(); continue
-    if search is not None:
-        if b == 0x0d or b == 0x0a:                   # Enter: accept + run
-            search_accept(); search = None
-            submit(); continue
-        if b == 0x7f or b == 0x08:                   # backspace query
-            search = search[:-1]; search_idx = 0; redraw_search(); continue
-        if b == 0x03:                                # Ctrl-C cancels
-            search = None; out("^C"); redraw(); continue
-        if b >= 0x20:
-            search += ch.decode("utf-8", "replace"); search_idx = 0
-            redraw_search(); continue
-        continue
+# ----------------------------------------------------------------- the loop
+prompt
+LINE=''
+POS=1
+FIRST=1
 
-    # ---- editable line ----
-    if b in (0x0d, 0x0a):                            # Enter
-        submit(); continue
-    if b == 0x01:                                    # Ctrl-A home
-        pos = 0; redraw(); continue
-    if b == 0x05:                                    # Ctrl-E end
-        pos = len(line); redraw(); continue
-    if b == 0x02:                                    # Ctrl-B left
-        if pos > 0: pos -= 1; out("\x1b[D")
-        continue
-    if b == 0x06:                                    # Ctrl-F right
-        if pos < len(line): pos += 1; out("\x1b[C")
-        continue
-    if b == 0x0b:                                    # Ctrl-K kill to end
-        del line[pos:]; redraw(); continue
-    if b == 0x15:                                    # Ctrl-U kill line
-        line, pos = bytearray(), 0; redraw(); continue
-    if b == 0x17:                                    # Ctrl-W kill word
-        i = pos
-        while i > 0 and line[i-1:i] == b" ": i -= 1
-        while i > 0 and line[i-1:i] not in (b" ", b""):
-            i -= 1
-        del line[i:pos]; pos = i; redraw(); continue
-    if b == 0x03:                                    # Ctrl-C (empty line)
-        out("^C"); line, pos = bytearray(), 0; prompt(); continue
-    if b == 0x04:                                    # Ctrl-D EOF
-        out("\nlogout\n"); break
-    if b == 0x0c:                                    # Ctrl-L clear
-        out("\x1b[2J\x1b[H"); redraw(); continue
-    if b in (0x7f, 0x08):                            # Backspace
-        if pos > 0:
-            del line[pos-1:pos]; pos -= 1; redraw()
-        continue
-    if b == 0x09 and not inq:                        # Tab: complete commands/paths
-        toks = line.decode("utf-8", "replace").split()
-        tok = toks[-1] if toks else ""
-        if "/" in tok:
-            comps = capture('compgen -f -- "%s" 2>/dev/null | sort | head -40' % tok.replace('"', ""))
-        else:
-            comps = capture('compgen -c -- "%s" 2>/dev/null | sort -u | head -40' % tok.replace('"', ""))
-        if len(comps) == 1 and comps[0]:
-            base = line.decode("utf-8", "replace")
-            add = comps[0] + ("/" if os.path.isdir(comps[0]) else " ")
-            rpl = base[:base.rfind(tok)] if tok else base
-            line = bytearray(rpl + add); pos = len(line); redraw()
-        elif len(comps) > 1:
-            pre = os.path.commonprefix(comps)
-            if len(pre) > len(tok):
-                base = line.decode("utf-8", "replace")
-                rpl = base[:base.rfind(tok)] if tok else base
-                line = bytearray(rpl + pre); pos = len(line)
-            out("\n" + "  ".join(comps[:20]) + (" ..." if len(comps) > 20 else "") + "\n")
-            redraw()
-        continue
-    if b >= 0x20:
-        line[pos:pos] = ch
-        pos += 1
-        sys.stdout.buffer.write(ch); sys.stdout.flush()
+while :; do
+    if [ "$FIRST" = 1 ]; then
+        FIRST=0
+        # Tell the child to survive SIGINT, and turn on bracketed paste.
+        printf 'trap "" INT\n' >&$CMD_FD 2>/dev/null || true
+        emit "$(printf '\033[?2004h')"
+    fi
+    prompt
+
+    ESC=''
+    while :; do
+        # ⛔ ONE BYTE AT A TIME, WITH A SENTINEL, AND THE SENTINEL IS THE
+        # WHOLE TRICK. `C=$(dd bs=1 count=1)` STRIPS A TRAILING NEWLINE, so
+        # pressing Enter produced the EMPTY STRING, the EOF test read it as
+        # end of input, and the session exited on the first Enter with the
+        # command never run. Measured on dash: a piped "ab\n" arrives as a, b,
+        # then EMPTY. Appending a sentinel INSIDE the substitution makes the
+        # newline non-trailing, so the shell has nothing to strip, and the
+        # sentinel is removed afterwards. One fork per keystroke and no bashism.
+        #
+        # `read -n 1` is the obvious alternative and dash refuses it:
+        # `dash: read: Illegal option -t` for the timeout form, and `-n` is
+        # the same family of extension.
+        C=$(dd bs=1 count=1 2>/dev/null; printf x)
+        C=${C%x}
+        if [ -z "$C" ]; then
+            cleanup
+        fi
+
+        # A bare ESC is the start of a sequence. Hold it and take the next
+        # byte, and drop the pair if the second byte is not a bracket, which
+        # is what a real ESC key press looks like.
+        if [ -z "$ESC" ]; then
+            if [ "$C" = "$ESC_ESC" ]; then
+                ESC=1
+                continue
+            fi
+        else
+            case "$ESC$C" in
+                '[A') hist_prev; redraw; ESC=''; continue ;;
+                '[B') hist_next; redraw; ESC=''; continue ;;
+                '[C') [ "$POS" -le "${#LINE}" ] && { POS=$((POS + 1)); redraw; }; ESC=''; continue ;;
+                '[D') [ "$POS" -gt 1 ] && { POS=$((POS - 1)); redraw; }; ESC=''; continue ;;
+                '[H'|'[1~') POS=1; redraw; ESC=''; continue ;;
+                '[F'|'[4~') POS=$((${#LINE} + 1)); redraw; ESC=''; continue ;;
+                '[3~') del_at; redraw; ESC=''; continue ;;
+                *) ESC=''; continue ;;
+            esac
+        fi
+
+        case "$C" in
+            "$CR"|"$NL")
+                emit "$NL"
+                CMD=$LINE
+                LINE=''; POS=1
+                run_command "$CMD"
+                prompt
+                break
+                ;;
+            "$BRK")
+                backspace; redraw
+                continue
+                ;;
+            "$TAB")
+                complete_tab
+                continue
+                ;;
+            "$ESC_ETX")
+                # Ctrl-C. While a command runs this script is not reading, so
+                # this only fires at the prompt: it abandons the line.
+                emit "^C$NL"
+                LINE=''; POS=1
+                prompt
+                break
+                ;;
+            "$ESC_EOT")
+                cleanup
+                ;;
+            "$ESC_A") POS=1; redraw; continue ;;
+            "$ESC_E") POS=$((${#LINE} + 1)); redraw; continue ;;
+            "$ESC_B") [ "$POS" -gt 1 ] && { POS=$((POS - 1)); redraw; }; continue ;;
+            "$ESC_F") [ "$POS" -le "${#LINE}" ] && { POS=$((POS + 1)); redraw; }; continue ;;
+            "$ESC_K") kill_to_end; redraw; continue ;;
+            "$ESC_U") kill_to_start; redraw; continue ;;
+            "$ESC_W") kill_word; redraw; continue ;;
+            "$ESC_R")
+                SEARCH=''
+                rsearch_draw
+                while :; do
+                    C2=$(dd bs=1 count=1 2>/dev/null; printf x)
+                    C2=${C2%x}
+                    [ -z "$C2" ] && cleanup
+                    case "$C2" in
+                        "$CR"|"$NL")
+                            LINE=$SEARCH_HIT
+                            POS=$((${#LINE} + 1))
+                            redraw
+                            break
+                            ;;
+                        "$ESC_ETX")
+                            emit "^C$NL"
+                            LINE=''; POS=1
+                            break
+                            ;;
+                        "$BRK")
+                            _sk=$(( ${#SEARCH} - 1 ))
+                            if [ "$_sk" -le 0 ]; then SEARCH=''; else
+                                SEARCH=$(printf '%s' "$SEARCH" | cut -c1-"$_sk")
+                            fi
+                            rsearch_draw
+                            continue
+                            ;;
+                        "$ESC_R") rsearch_next; continue ;;
+                        *)
+                            SEARCH="$SEARCH$C2"
+                            rsearch_draw
+                            continue
+                            ;;
+                    esac
+                done
+                continue
+                ;;
+            "$ESC_ESC")
+                continue
+                ;;
+            *)
+                ins "$C"
+                redraw
+                continue
+                ;;
+        esac
+    done
+done
