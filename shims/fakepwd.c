@@ -1,12 +1,15 @@
-/* fakepwd.c — synthetic passwd database for cages with no /etc/passwd.
+/* fakepwd.c  -  synthetic passwd database for cages with no /etc/passwd.
  *
  * LD_PRELOAD into any dynamically linked program (ssh, ssh-keygen, curl's
  * tools, ...) that calls getpwuid/getpwnam and aborts on failure.
  *
  * User database source, in order:
- *   1. $SANDSSH_PASSWD file (standard passwd(5) format, one user per line)
- *   2. /etc/sandssh/passwd
- *   3. built-in default: root with uid/gid 0, home /root, shell /bin/bash
+ *   1. $SANDHOME_PASSWD file (standard passwd(5) format, one user per line)
+ *   2. $SANDSSH_PASSWD, the name this shim answered to before it moved here.
+ *      Still read, so a machine configured against the old name keeps working
+ *      after an upgrade; sandhome itself sets only the first.
+ *   3. /etc/sandhome/passwd
+ *   4. built-in default: root with uid/gid 0, home /root, shell /bin/bash
  *
  * Build: gcc -shared -fPIC -O2 -o fakepwd.so fakepwd.c
  * Use:   LD_PRELOAD=./fakepwd.so ssh user@host
@@ -29,8 +32,9 @@ static int nusers = -1;
 static void load(void) {
     if (nusers >= 0) return;
     nusers = 0;
-    const char *path = getenv("SANDSSH_PASSWD");
-    if (!path) path = "/etc/sandssh/passwd";
+    const char *path = getenv("SANDHOME_PASSWD");
+    if (!path) path = getenv("SANDSSH_PASSWD");
+    if (!path) path = "/etc/sandhome/passwd";
     FILE *f = fopen(path, "r");
     if (f) {
         while (fgets(lines[nusers], LNLEN, f) && nusers < MAXU) {
