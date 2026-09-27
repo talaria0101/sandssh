@@ -1,0 +1,32 @@
+name: sandhome
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: seating
+        run: |
+          command -v dash || sudo apt-get update -qq && sudo apt-get install -y dash
+          dash -c 'echo dash $(dash -c "echo ok")'
+
+      - name: syntax under dash and bash --posix
+        run: sh tests/syntax.sh
+
+      - name: the unit, space and shim clauses
+        run: sh tests/unit.sh && sh tests/space.sh && sh tests/shims.sh
+
+      - name: the end-to-end bootstrap
+        run: sh tests/bootstrap.sh
+
+      - name: errandsh over pipes
+        run: bash tests/errandsh-posix.sh
+
+      - name: the whole suite, as a caller reads it
+        run: sh tests/run.sh

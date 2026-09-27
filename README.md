@@ -1,43 +1,85 @@
-# sandssh
+# sandhome
 
-**This tree is now the compatibility half of podbox's ssh transport.** The
-transport itself lives in podbox, as `podbox remote ssh` and the standalone
-`podssh`. This repository is kept, for now, for three things and no others.
+A portable home for agents that run inside an errand/bailey-style sandbox: one
+bootstrap, one environment, and a set of skills, guides and tools that turn a
+bare userland into a place where work can actually happen.
 
-## What is still here, and why
+The one problem it exists for is measured, not assumed: **a mount can be writable
+and still refuse `execve`.** A sandbox can point `HOME` at a large disk that
+reads and writes fine and denies execution, while `/tmp` allows it and is small.
+Every hand-built userland handles that differently, and the difference is found
+weeks later inside a job that fails for a reason nobody wrote down. `sandhome`
+splits the two: data on the big root, executables on the root that runs them.
 
-| path | why it is still here |
+## Quick start
+
+```sh
+# from a clone
+sh bootstrap.sh --toolset developer
+
+# or from a pipe
+curl -fsSL https://raw.githubusercontent.com/talaria0101/sandssh/main/bootstrap.sh \
+  | sh -s -- --toolset developer
+```
+
+Then, in any new shell:
+
+```sh
+. "$HOME/.local/share/sandhome/env.sh"   # or let the installed profile do it
+sandhome doctor
+sandhome space --probe
+```
+
+## What it sets up
+
+| piece | what it does |
 | --- | --- |
-| `bin/sandssh` | the interop client. `podbox`'s `crates/podbox-ssh/tests/e2e.sh` runs this tree's own client against podssh's relay and server, unchanged, to prove podssh is a replacement and not a fork. |
-| `relay/sandssh-relay.py` | the interop relay, and the same proof in the other direction. |
-| `shims/fakepwd.c` | the passwd shim for a cage with no `/etc/passwd`. podbox's builder compiles this; the reference has to live somewhere. |
-| `shims/fakepty.c` | the isatty/termios interposer for a cage with no pty. Still the only one. |
-| `patches/dropbear-*.patch` | the two dropbear changes a seccomp-filtered cage needs. `dropbear-setgroups` is the one upstream keeps moving, so podbox re-applies it by hand. |
-| `research/RELAY-BENCHMARKS.md` | the measured relay table podbox's catalog cites. |
-| `CLEANUP.md` | what was removed on 2026-09-27 and what replaced each thing. |
+| `bootstrap.sh` | detects the machine, plans the two roots, adopts or installs the toolchains, builds the shims a cage needs, writes the environment and reports what it read |
+| `bin/sandhome` | `doctor`, `env`, `path`, `space`, `toolchains`, `install`, `shims`, `shell`, `exec`, `report`, `gc` |
+| `lib/` | the POSIX-sh library: detection, the exec/space plan, fetch+digest, env, the toolchain contract, shims, report |
+| `tools/` | one module per toolchain: `jq`, `ripgrep`, `fd`, `python`, `node`, `rust`, `go` |
+| `shims/` | `fakepty` (an isatty/termios interposer) and `fakepwd` (a synthetic passwd database) |
+| `shell/errandsh` | a POSIX-sh line discipline for pty-less SSH sessions |
+| `skills/` | Agent Skills this home provides |
+| `docs/` | the guide and the decisions behind each shape |
 
-## What is gone, and what replaced it
+Everything is POSIX `sh`. The library depends on the shell and almost nothing
+else: not `awk`, not `sed`, not `grep`, not `tr`, not `find`, not `install`. A
+bootstrap whose job is to install the missing tools cannot require them first.
 
-Everything else. The Cloudflare Worker relay and its client, the open-proxy
-scanner, the GitHub control channel, the start/install scripts, the `ssh`
-and `getent` wrapper scripts, and the tailnet patches are all either
-superseded by podbox or answered by a better relay. `CLEANUP.md` names a
-successor for every one, because a file deleted with no successor is a loss
-dressed as tidying.
+## Why two roots
 
-Every removal is in this repository's history, and the history is the record
-of what was measured.
+`sandhome space --probe` is the report to read when a toolchain will not run. On
+the sandbox this was built in:
 
-## The one thing to know about the shims
+```
+candidate=/workspace   writable=yes exec=no  free_mb=191000
+candidate=/dev/shm     writable=yes exec=yes free_mb=244
+candidate=/tmp         writable=yes exec=yes free_mb=414
+```
 
-Both are `LD_PRELOAD` and **neither can reach a statically linked binary**.
-That is not a caveat, it is the measurement that shaped podbox's ssh server:
-a statically linked dropbear carries its own libc, so it cannot see that
-`root` exists and logs `Login attempt for nonexistent user` for a user that
-is there. podbox's builder therefore produces a DYNAMICALLY linked dropbear.
-See `docs/decisions/ssh-server-in-a-cage.md` in podbox.
+`/workspace` is where the data wants to live and cannot run a binary. Executables
+are copied to the exec root; shared objects are **symlinked**, because
+`mmap(PROT_EXEC)` is allowed where `execve` is not, and copying a 191MB
+`libLLVM.so` onto a 400MB root would not fit. See
+[`docs/decisions/exec-split.md`](docs/decisions/exec-split.md).
+
+## The rest of this repository
+
+`sandssh`'s ssh transport and the podbox interop live on here unchanged:
+`bin/sandssh` (the Python client), `relay/sandssh-relay.py`, `patches/`, and the
+`research/` measurements. `CLEANUP.md` records what was removed and what replaced
+it. `sandhome` is the layer above them.
+
+## Tests
+
+```sh
+sh tests/run.sh
+```
+
+Green means every clause passed; the runner prints `passed`, `skipped` and
+`failed` separately, because "could not run" is a different claim from "passed".
 
 ## Licence
 
-See `LICENSE`. The patches are against dropbear, which is MIT-licensed, and
-carry no dropbear code.
+See [`LICENSE`](LICENSE).

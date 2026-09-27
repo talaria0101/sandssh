@@ -1,0 +1,161 @@
+#!/bin/sh
+# sandhome - the one command. POSIX sh; sources the library from the checkout it
+# lives in, or from SANDHOME_REPO, so a copy installed under a prefix works.
+set -u
+
+SH_SELF=sandhome
+
+# Resolve the repository directory: the environment wins, then this script's own
+# path. A script read from a pipe has no path, and that case is refused rather
+# than guessed, because sourcing the wrong library is worse than not starting.
+if [ -n "${SH_REPO_DIR:-}" ]; then
+    sh_repo=$SH_REPO_DIR
+else
+    case "$0" in
+        */*) sh_repo=$(CDPATH='' cd -- "${0%/*}/.." && pwd) ;;
+        *)   printf 'sandhome: cannot find the sandhome library; run it by path or set SANDHOME_REPO\n' >&2
+             exit 2 ;;
+    esac
+fi
+if [ ! -r "$sh_repo/lib/common.sh" ]; then
+    printf 'sandhome: no library under %s; set SANDHOME_REPO\n' "$sh_repo" >&2
+    exit 2
+fi
+
+SH_REPO_DIR=$sh_repo
+SH_LIB_DIR="$sh_repo/lib"
+export SH_REPO_DIR SH_LIB_DIR
+
+# shellcheck source=../lib/common.sh
+. "$SH_LIB_DIR/common.sh"
+# shellcheck source=../lib/detect.sh
+. "$SH_LIB_DIR/detect.sh"
+# shellcheck source=../lib/space.sh
+. "$SH_LIB_DIR/space.sh"
+# shellcheck source=../lib/fetch.sh
+. "$SH_LIB_DIR/fetch.sh"
+# shellcheck source=../lib/env.sh
+. "$SH_LIB_DIR/env.sh"
+# shellcheck source=../lib/toolchain.sh
+. "$SH_LIB_DIR/toolchain.sh"
+# shellcheck source=../lib/shim.sh
+. "$SH_LIB_DIR/shim.sh"
+# shellcheck source=../lib/report.sh
+. "$SH_LIB_DIR/report.sh"
+
+sh_detect_all
+sh_space_plan
+
+usage() {
+    cat <<'USAGE'
+usage: sandhome COMMAND [args]
+
+  doctor                 probe the environment and report what is missing
+  env                    print the environment, for `eval "$(sandhome env)"`
+  path                   print the exec-view bin directory
+  space [--probe]        where the two roots are, and every candidate tried
+  toolchains             list the toolchains this tree can set up
+  install NAME...        adopt or install each toolchain, then write the env
+  ensure NAME...         alias for install
+  shims [build]          build the LD_PRELOAD shims this machine needs
+  shselftest             exercise the shims and the exec split on this machine
+  shell [args]           run errandsh, the pty-less line discipline
+  exec CMD...            run CMD with the sandhome environment loaded
+  report [--json]        the full report
+  gc [DAYS]              remove staging older than DAYS (default 7)
+  version                print the schema version
+  help                   this text
+
+Environment:
+  SANDHOME_HOME   the persistent data root (default $XDG_DATA_HOME/sandhome)
+  SANDHOME_EXEC   the exec-capable root; detected when unset
+  SANDHOME_REPO   the checkout that holds lib/, tools/ and shell/
+USAGE
+}
+
+cmd_env()    { sh_env_print; }
+cmd_path()   { printf '%s\n' "$SH_EXEC_BIN"; }
+cmd_space() {
+    if [ "${1:-}" = --probe ]; then
+        sh_space_probe_report
+        return 0
+    fi
+    sh_space_report
+}
+cmd_toolchains() {
+    for sh_c_t in $(sh_toolchain_available); do
+        sh_toolchain_load "$sh_c_t" >/dev/null 2>&1
+        eval "sh_c_desc=\${TC_${sh_c_t}_DESC:-}"
+        printf '%-8s %s\n' "$sh_c_t" "$sh_c_desc"
+    done
+}
+cmd_install() {
+    if [ "$#" -eq 0 ]; then
+        sh_die 'install needs at least one toolchain name'
+    fi
+    sh_env_load
+    for sh_c_n in "$@"; do
+        sh_toolchain_ensure "$sh_c_n" || true
+    done
+    sh_env_write
+    SH_INSTALLED=$INSTALLED
+    SH_ADOPTED=$ADOPTED
+    sh_env_load
+    return 0
+}
+cmd_shims() {
+    if [ "${1:-build}" = build ]; then
+        sh_shim_build_all "$SH_REPO_DIR/shims"
+        sh_shim_write_passwd
+    fi
+    sh_shim_report
+}
+cmd_shell() {
+    sh_env_load
+    if [ -x "$SH_EXEC_BIN/errandsh" ]; then
+        exec "$SH_EXEC_BIN/errandsh" "$@"
+    fi
+    if [ -r "$SH_REPO_DIR/shell/errandsh" ]; then
+        exec sh "$SH_REPO_DIR/shell/errandsh" "$@"
+    fi
+    sh_die 'no errandsh found'
+}
+cmd_exec() {
+    if [ "$#" -eq 0 ]; then
+        sh_die 'exec needs a command'
+    fi
+    sh_env_load
+    exec "$@"
+}
+cmd_report() {
+    sh_env_load
+    if [ "${1:-}" = --json ]; then
+        sh_report_json
+    else
+        sh_report_text
+    fi
+}
+cmd_gc() { sh_say "removed $(sh_space_gc "${1:-7}") staging entries"; }
+cmd_version() { printf 'sandhome/1\n'; }
+
+case "${1:-help}" in
+    doctor)      sh_env_load; sh_doctor || exit 1 ;;
+    env)         cmd_env ;;
+    path)        cmd_path ;;
+    space)       shift; cmd_space "$@" ;;
+    toolchains)  cmd_toolchains ;;
+    install|ensure) shift; cmd_install "$@" ;;
+    shims)       shift; cmd_shims "$@" ;;
+    shell)       shift; cmd_shell "$@" ;;
+    exec)        shift; cmd_exec "$@" ;;
+    report)      shift; cmd_report "$@" ;;
+    gc)          shift; cmd_gc "$@" ;;
+    version)     cmd_version ;;
+    help|-h|--help) usage ;;
+    *)           usage >&2; sh_die "unknown command $1" ;;
+esac
+
+if [ "$SH_FAILURES" -gt 0 ]; then
+    exit 1
+fi
+exit 0
