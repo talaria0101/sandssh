@@ -1,5 +1,10 @@
 # Railway free VM: benchmarks and usefulness, 2026-09-26
 
+A historical record. Tools named below (`chain.py`, `find_relays.py`) were
+written for this measurement, are not in this repository, and are not part of
+anything here; they appear because the measurement and its failures are the
+evidence, and cutting the sentence would cut the reason.
+
 Conditions for every number below. Sandbox: Linux sandbox
 6.18.39-gentoo x86_64, uid 0, no /etc/passwd, egress via CONNECT
 proxy from env (port varies per session), `date -u` Sat Sep 26
@@ -318,10 +323,19 @@ Read, not assumed:
 
 ## Reproduction
 
-    git clone https://github.com/talaria0101/sandssh
-    cd sandssh/bridge/railway
-    python3 find_relays.py /path/to/fresh/proxy/list.txt 0 200   # 22 workers
-    RELAYS=165.22.103.5:443 LD_PRELOAD=./fakepwd.so \
-      ssh -o ProxyCommand="python3 $(pwd)/chain.py" -o ConnectTimeout=12 \
-          -o BatchMode=yes -o StrictHostKeyChecking=no \
-          -o UserKnownHostsFile=/dev/null -i your_key railway.new 'uname -a'
+The scripts that took this measurement are not in this repository and are not
+recoverable from a current checkout. What is recoverable is the git history of
+this repository, and the shape of what was done:
+
+1. a proxy list was scanned with 22 concurrent workers, filtered to
+   `host:port 0 200` (an open CONNECT proxy answering 200 to a probe);
+2. a target was reached through each survivor by chaining two CONNECT hops,
+   with `LD_PRELOAD=./fakepwd.so` because the target had no `/etc/passwd`;
+3. an ssh session was run through that chain with
+   `ConnectTimeout=12 BatchMode=yes`, and the exit code read from the ssh
+   process directly rather than through a pipe;
+4. each run wrapped in `timeout 40` to `timeout 90`.
+
+If you re-take this, re-take the whole thing rather than these steps: a public
+relay set from 2026-09-26 has no bearing on today, and the value here is the
+method and the failure taxonomy, not the addresses.

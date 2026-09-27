@@ -1,71 +1,140 @@
-# Deploying the sandssh relay (mode B) — copy-paste guide
+# Deploying the sandssh relay (mode B)
 
-The relay is `relay/sandssh-relay.py`: stdlib python, no dependencies, dumb
-ciphertext pipe. Both peers dial OUT to it, so it needs no inbound from the
-cage — the cage's *egress* to it is what must be allowed.
+The relay is `relay/sandssh-relay.py`: Python standard library only, no
+dependencies, and a dumb ciphertext pipe. Both peers dial OUT to it, so it needs
+no inbound connection from the cage. What must be allowed is the cage's
+*egress* to the relay.
+
+Copy this page; every command is one you can run.
 
 ## 1. Generate a shared key (once)
 
-    openssl rand -hex 32    # this is $SANDSSH_RELAY_KEY
+```sh
+openssl rand -hex 32
+```
 
-## 2. Run the relay (pick one)
+That value is the relay's `--key` and the peers' `--auth`. Anyone who has it
+can pair, so it is a secret and belongs in an environment file with mode 0600,
+not on a command line in a shell history.
 
-### systemd (VPS)
+## 2. Run the relay
 
-    sudo useradd -r -s /usr/sbin/nologin sandssh || true
-    sudo install -m 755 relay/sandssh-relay.py /usr/local/bin/sandssh-relay
-    # /etc/sandssh-relay.env:
-    #   SANDSSH_RELAY_KEY=<key from step 1>
-    sudo systemctl enable --now sandssh-relay
+Pick one.
 
-See `sandssh-relay.service` in this directory. Listens on 127.0.0.1:8443.
+### systemd
 
-### plain process (no root)
+```sh
+sudo useradd -r -s /usr/sbin/nologin sandssh || true
+sudo install -m 755 relay/sandssh-relay.py /usr/local/bin/sandssh-relay
+```
 
-    SANDSSH_RELAY_KEY=<key> python3 relay/sandssh-relay.py --listen 127.0.0.1:8443
+Then write `/etc/sandssh-relay.env`:
 
-## 3. TLS in front (caddy layer4 example)
+```
+SANDSSH_RELAY_KEY=<the key from step 1>
+```
 
-The v2 relay is a raw byte splice: give it its own port and let caddy
-terminate TLS on it (layer4 / tcp proxying, not the http app module):
+and `chmod 600` it. `sandssh-relay.service` in this directory reads that file
+and listens on `127.0.0.1:8443`:
 
-    # /etc/caddy/Caddyfile (layer4 needs the caddy-l4 plugin or nginx stream)
-    {
-        layer4 {
-            :8443 {
-                tls
-                proxy 127.0.0.1:8444
-            }
+```sh
+sudo install -m 644 relay/sandssh-relay.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sandssh-relay
+```
+
+### plain process, no root
+
+```sh
+SANDSSH_RELAY_KEY=<key> python3 relay/sandssh-relay.py --listen 127.0.0.1:8443
+```
+
+### a unix socket, for a cage that cannot bind
+
+```sh
+python3 relay/sandssh-relay.py --listen /tmp/relay.sock --key <key>
+```
+
+The scheme a peer uses depends on its transport. With the default, raw:
+`--relay unix:///tmp/relay.sock` (three slashes, the target is an absolute
+path). With `--transport ws`: `--relay ws+unix:///tmp/relay.sock`. This is the
+shape to test in, because it needs no port at all. `sandssh` says so in its
+error when a scheme is not one of `ws://`, `wss://` or `ws+unix://`.
+
+## 3. TLS
+
+The relay splices raw bytes, so TLS belongs in front of it, on its own port.
+caddy, with the layer4 plugin (the plain http module will not do):
+
+```
+# /etc/caddy/Caddyfile
+{
+    layer4 {
+        :443 {
+            tls
+            proxy 127.0.0.1:8443
         }
     }
-    # relay itself then listens on 127.0.0.1:8444
+}
+```
 
-nginx equivalent:
+nginx, equivalently:
 
-    stream { server { listen 8443; proxy_pass 127.0.0.1:8444; } }
-    # plus certs: listen 8443 ssl;
+```
+stream {
+    server {
+        listen 443 ssl;
+        proxy_pass 127.0.0.1:8443;
+    }
+}
+```
 
-Peers then use --relay tls://talaria.qaidvoid.dev:8443.
+Peers then use `--relay wss://<relay-host>/`. The relay can also terminate TLS
+itself, which is one process instead of two and is worth it on a small host:
 
-## 4. Allowlist one line in the errand daemon's egress config
+```sh
+python3 relay/sandssh-relay.py --listen :443 --key <key> \
+    --tls-cert fullchain.pem --tls-key privkey.pem
+```
 
-    talaria.qaidvoid.dev
+## 4. Allow the egress
 
-## 5. Cage side
+Whatever mediates the cage's egress needs one destination permitted: the relay
+host and port. A cage that reaches only a proxy needs the proxy permitted
+instead, and the relay reached through it.
 
-    ./start.sh serve --relay wss://talaria.qaidvoid.dev/sandssh --name agent1
+## 5. In the cage
 
-## 6. Laptop side (once, then it is just ssh)
+```sh
+sandssh serve --relay wss://<relay-host>/ --name agent1
+```
 
-    curl -fsSL https://raw.githubusercontent.com/talaria0101/sandssh/main/bin/sandssh \
-        -o ~/bin/sandssh && chmod +x ~/bin/sandssh
-    sandssh config --relay wss://talaria.qaidvoid.dev/sandssh --name agent1 >> ~/.ssh/config
-    ssh agent1          # native openssh, interactive, scp/rsync work too
+`--name` is what the relay pairs by, so it must be the same on both ends.
+`--dropbear` and `--chroot` point at a dynamically linked server and its chroot
+when the defaults do not apply; a statically linked server cannot be reached by
+`fakepwd.so` at all.
+
+## 6. On the machine you connect from
+
+```sh
+sandssh config --relay wss://<relay-host>/ --name agent1 >> ~/.ssh/config
+ssh agent1
+```
+
+`sandssh config` writes the `ProxyCommand` line; after that it is ordinary ssh,
+so `scp`, `rsync` and every interactive feature work unchanged. `--insecure`
+skips certificate verification, which is for a relay under test and not for one
+in production.
 
 ## Security notes
 
-- The relay only ever sees ssh ciphertext; its auth header (step 1 key)
-  keeps randoms from consuming slots. ssh pubkey auth is the real gate.
-- Run it behind a proxy with per-IP connection limits if exposed publicly.
-- The node redials forever; the client retries within one ProxyCommand
-  process, so ssh reconnects cleanly after relay restarts.
+- The relay only ever sees ssh ciphertext. Its `--key` keeps strangers from
+  consuming a slot; the real gate is ssh public-key authentication on the far
+  end, so the relay's secret is not the thing protecting the cage.
+- Run it behind a proxy with per-IP connection limits if it is publicly
+  reachable. A relay with no limits is a free bandwidth relay.
+- The node redials forever. The client retries within one `ProxyCommand`
+  process, so ssh reconnects cleanly after a relay restart and a user does not
+  notice it.
+- A public relay is perishable. `research/RELAY-BENCHMARKS.md` has the measured
+  behaviour and is stale by construction; re-measure rather than trust it.

@@ -1,4 +1,4 @@
-/* fakepty.c — make a pipe-backed shell believe it has a terminal.
+/* fakepty.c  -  make a pipe-backed shell believe it has a terminal.
  *
  * For environments where the kernel offers no /dev/ptmx (sealed cages,
  * seccomp profiles without mknod/devpts, some CI sandboxes). Interposes

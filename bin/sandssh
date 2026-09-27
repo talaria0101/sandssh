@@ -18,6 +18,7 @@ Subcommands:
                                        laptop side: ssh ProxyCommand target
   sandssh gh-listen --gist ID [--secret K]        node side control channel
   sandssh gh-send --gist ID -- CMD...  operator side control channel
+  sandssh gh-shell --name N [--token T]  line-at-a-time shell over the channel
   sandssh selftest                     framing/pairing unit tests (no network)
   sandssh config --relay URL --name N  print an ~/.ssh/config snippet
 
