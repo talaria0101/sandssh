@@ -31,6 +31,32 @@ it is one static binary with the shims built in, and its `AGENTS.md` is the
 entry point. This tree is still the reference for the shape, the deployment and
 the measurements, and it is what `podbox`'s interop tests exercise.
 
+⛔ **THE MULTIPLEXED REVERSE PATH IS IMPLEMENTED IN `dropssh`, AND IT IS THE
+ANSWER TO "SHOULD THIS TREE GET IT TOO".** Measured 2026-09-28 against
+`tcp.ssh.relay.ajam.dev` through a 443-only CONNECT proxy: two concurrent
+pubkey sessions on **one** node socket, one sleeping while the other
+transferred 270177 bytes back byte for byte. `cmd_serve` here is still
+one-session-per-connection, on purpose: this tree is the interop reference and
+the measurement record, `podbox`'s tests exercise it, and the multiplexer would
+have to be written twice to stay identical. The protocol, the four-way
+measurement and the close codes are in
+`dropssh/docs/reverse-relay.md` and `dropssh/docs/multiplexing.md`.
+
+⛔ **AND THE RELAY PROTOCOL HAS THREE CLOSE CODES THAT A CLIENT MUST TELL
+APART.** Measured live 2026-09-28, 3/3 runs each, and none of them is silence:
+
+| close | who | meaning |
+| --- | --- | --- |
+| `1003` `binary frames required` | operator or node | a text frame was sent where a data frame was required |
+| `1008` `wait for ready` | operator | session data was sent before the node answered `open` with `ready`; the node is then closed `1003` `unknown session id` |
+| `1009` `bad multiplex frame` | node | a data frame carried no 32-hex session id; the operator is then closed `1011` `node disconnected` |
+
+⛔ **AN EARLIER REVISION OF THIS TREE'S RESEARCH SAID 1009 DID NOT EXIST** --
+that a node frame without the id prefix is "silently dropped, no error, no
+close". That is wrong. It was re-measured and the drop is loud and named, and
+`dropssh/tests/mux-probe.py` asserts the close so the claim lives in a test
+rather than in a document.
+
 ## Reading order
 
 1. This file.

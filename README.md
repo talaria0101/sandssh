@@ -26,6 +26,32 @@ Nothing listens in the cage and nothing needs to. The ssh session between the
 real peers is end to end encrypted, so the relay carries ciphertext and nothing
 else: the simpler it is, the fewer ways it can stall.
 
+## The reverse path is multiplexed, and it is implemented in C
+
+The node dials out **once** and holds that websocket; every operator session
+travels on it, told apart by a 32-hex id the relay puts in front of each frame
+and strips on the way back. Measured 2026-09-28 against
+`tcp.ssh.relay.ajam.dev` through a 443-only CONNECT proxy: **two concurrent
+pubkey sessions on one node socket**, one sleeping while the other transferred
+270177 bytes back byte for byte.
+
+That implementation is [`dropssh`](https://github.com/talaria0101/dropssh) —
+one static C binary, and the right thing to reach for. **This tree stays the
+interop reference and the measurement record**: `cmd_serve` here is
+deliberately one-session-per-connection, because `podbox`'s tests exercise this
+client and relay unchanged, and a multiplexer written twice would not stay
+identical. The protocol, the four-way measurement and the three close codes
+are in [`research/REVERSE-PROTOCOL.md`](research/REVERSE-PROTOCOL.md), and
+`tests/relay-probe.mjs` re-measures all of it live.
+
+⛔ **One of those measurements CORRECTED an earlier claim in this tree.** A node
+data frame without its id prefix is not "silently dropped, no error, no
+close": the relay closes the **node** socket with `1009 bad multiplex frame`
+and the operator with `1011 node disconnected`. Three close codes, three
+different bugs — `1003` for a text frame on a data leg, `1008` for data sent
+before `ready`, `1009` for a frame with no id — and in C the opcode is chosen
+by the frame writer, so they have to be logged distinctly.
+
 ## Use it
 
 `sandssh probe` maps every route the network allows and recommends one. Then:
